@@ -19,3 +19,7 @@ aid-contract = { path = "../contracts/aid-contract" }
 treasury-contract = { path = "../contracts/treasury-contract" }
 referral-contract = { path = "../contracts/referral-contract" }
 proptest = "1.4"
+
+[[bin]]
+name = "invariant-monitor"
+path = "src/bin/invariant_monitor.rs"

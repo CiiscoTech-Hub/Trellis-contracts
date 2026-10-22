@@ -65,6 +65,58 @@ pub enum InvariantViolation {
         expected_delta: i128,
         actual_delta: i128,
     },
+    /// Ownership constraint violated.
+    OwnershipViolated {
+        record_id: String,
+        expected_owner: String,
+        actual_owner: String,
+    },
+    /// Lifecycle state machine violation.
+    LifecycleViolated {
+        record_id: String,
+        invalid_state: String,
+    },
+    /// Authorization constraint violated.
+    AuthorizationViolated {
+        record_id: String,
+        actor: String,
+        action: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Severity {
+    Critical,
+    High,
+    Medium,
+}
+
+impl InvariantViolation {
+    pub fn severity(&self) -> Severity {
+        match self {
+            Self::AssetConservationViolated { .. } => Severity::Critical,
+            Self::SolvencyBackingMismatched { .. } => Severity::Critical,
+            Self::ReversionInvarianceViolated { .. } => Severity::Critical,
+            Self::ImpossibleBalanceDetected { .. } => Severity::Critical,
+            Self::MisallocatedBalance { .. } => Severity::High,
+            Self::OwnershipViolated { .. } => Severity::High,
+            Self::LifecycleViolated { .. } => Severity::High,
+            Self::AuthorizationViolated { .. } => Severity::High,
+        }
+    }
+
+    pub fn remediation(&self) -> &'static str {
+        match self {
+            Self::AssetConservationViolated { .. } => "Halt contract. Investigate minting/burning logic.",
+            Self::SolvencyBackingMismatched { .. } => "Halt contract. Reconcile physical balance with internal liabilities.",
+            Self::ReversionInvarianceViolated { .. } => "Halt contract. Review state reversion logic.",
+            Self::ImpossibleBalanceDetected { .. } => "Halt contract. Check external account calculation logic.",
+            Self::MisallocatedBalance { .. } => "Review balance deltas for inactive accounts.",
+            Self::OwnershipViolated { .. } => "Check owner transition logic. Pause record updates.",
+            Self::LifecycleViolated { .. } => "Check state machine transitions. Pause record updates.",
+            Self::AuthorizationViolated { .. } => "Review access control policy. Revoke compromised roles.",
+        }
+    }
 }
 
 /// Snapshot of an individual account's balance in the invariant model.
@@ -262,6 +314,105 @@ pub fn assert_reversion_invariance(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MonitorReport {
+    pub invariant_name: String,
+    pub passed: bool,
+    pub violation: Option<InvariantViolation>,
+}
+
+impl MonitorReport {
+    pub fn print_report(&self) {
+        if self.passed {
+            // Note: in a real environment this might use a logging framework
+        } else {
+            if let Some(v) = &self.violation {
+                let _sev = v.severity();
+                let _rem = v.remediation();
+                // "severity" and "remediation" can be accessed by callers.
+            }
+        }
+    }
+}
+
+pub struct InvariantMonitor;
+
+impl InvariantMonitor {
+    pub fn check_conservation(before: &AssetConservationSnapshot, after: &AssetConservationSnapshot) -> MonitorReport {
+        match verify_conservation(before, after) {
+            Ok(_) => MonitorReport {
+                invariant_name: String::from("Asset Conservation"),
+                passed: true,
+                violation: None,
+            },
+            Err(e) => MonitorReport {
+                invariant_name: String::from("Asset Conservation"),
+                passed: false,
+                violation: Some(e),
+            },
+        }
+    }
+
+    pub fn check_ownership(record_id: String, expected_owner: String, actual_owner: String) -> MonitorReport {
+        if expected_owner == actual_owner {
+            MonitorReport {
+                invariant_name: String::from("Ownership"),
+                passed: true,
+                violation: None,
+            }
+        } else {
+            MonitorReport {
+                invariant_name: String::from("Ownership"),
+                passed: false,
+                violation: Some(InvariantViolation::OwnershipViolated {
+                    record_id,
+                    expected_owner,
+                    actual_owner,
+                }),
+            }
+        }
+    }
+
+    pub fn check_lifecycle(record_id: String, is_valid_transition: bool, current_state: String) -> MonitorReport {
+        if is_valid_transition {
+            MonitorReport {
+                invariant_name: String::from("Lifecycle"),
+                passed: true,
+                violation: None,
+            }
+        } else {
+            MonitorReport {
+                invariant_name: String::from("Lifecycle"),
+                passed: false,
+                violation: Some(InvariantViolation::LifecycleViolated {
+                    record_id,
+                    invalid_state: current_state,
+                }),
+            }
+        }
+    }
+
+    pub fn check_authorization(record_id: String, is_authorized: bool, actor: String, action: String) -> MonitorReport {
+        if is_authorized {
+            MonitorReport {
+                invariant_name: String::from("Authorization"),
+                passed: true,
+                violation: None,
+            }
+        } else {
+            MonitorReport {
+                invariant_name: String::from("Authorization"),
+                passed: false,
+                violation: Some(InvariantViolation::AuthorizationViolated {
+                    record_id,
+                    actor,
+                    action,
+                }),
+            }
+        }
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Mutation Testing Helpers (Negative Invariant Proofs)
 // -----------------------------------------------------------------------------
@@ -303,6 +454,90 @@ pub mod mutations {
     ) {
         if let Some(acc) = snapshot.external_accounts.iter_mut().find(|a| a.account == *account) {
             acc.balance = -100;
+        }
+    }
+}
+#[cfg(test)]
+mod monitor_tests {
+    use super::*;
+    use soroban_sdk::Address;
+
+    #[test]
+    fn test_conservation_invariant_passes() {
+        let env = soroban_sdk::Env::default();
+        let addr1 = Address::generate(&env);
+        
+        let before = AssetConservationSnapshot {
+            ledger_sequence: 100,
+            external_accounts: vec![AccountBalanceRecord { account: addr1.clone(), label: String::from("user"), balance: 50 }],
+            contract_token_reserve: 100,
+            internal_liabilities: 100,
+        };
+        
+        let mut after = before.clone();
+        after.ledger_sequence = 101;
+        
+        let report = InvariantMonitor::check_conservation(&before, &after);
+        assert!(report.passed);
+        assert_eq!(report.violation, None);
+    }
+
+    #[test]
+    fn test_conservation_invariant_fails_invalid_fixture() {
+        let env = soroban_sdk::Env::default();
+        let addr1 = Address::generate(&env);
+        
+        let before = AssetConservationSnapshot {
+            ledger_sequence: 100,
+            external_accounts: vec![AccountBalanceRecord { account: addr1.clone(), label: String::from("user"), balance: 50 }],
+            contract_token_reserve: 100,
+            internal_liabilities: 100,
+        };
+        
+        let mut after = before.clone();
+        after.contract_token_reserve = 50; // Lost 50 tokens
+        
+        let report = InvariantMonitor::check_conservation(&before, &after);
+        assert!(!report.passed);
+        assert!(matches!(report.violation, Some(InvariantViolation::AssetConservationViolated { .. })));
+        
+        if let Some(v) = report.violation {
+            assert_eq!(v.severity(), Severity::Critical);
+        }
+    }
+
+    #[test]
+    fn test_ownership_invariant_fails_invalid_fixture() {
+        let report = InvariantMonitor::check_ownership(String::from("record_1"), String::from("Alice"), String::from("Bob"));
+        assert!(!report.passed);
+        assert!(matches!(report.violation, Some(InvariantViolation::OwnershipViolated { .. })));
+        
+        if let Some(v) = report.violation {
+            assert_eq!(v.severity(), Severity::High);
+            assert_eq!(v.remediation(), "Check owner transition logic. Pause record updates.");
+        }
+    }
+
+    #[test]
+    fn test_lifecycle_invariant_fails_invalid_fixture() {
+        let report = InvariantMonitor::check_lifecycle(String::from("record_2"), false, String::from("Settled"));
+        assert!(!report.passed);
+        assert!(matches!(report.violation, Some(InvariantViolation::LifecycleViolated { .. })));
+        
+        if let Some(v) = report.violation {
+            assert_eq!(v.severity(), Severity::High);
+        }
+    }
+
+    #[test]
+    fn test_authorization_invariant_fails_invalid_fixture() {
+        let report = InvariantMonitor::check_authorization(String::from("record_3"), false, String::from("Eve"), String::from("AdminAction"));
+        assert!(!report.passed);
+        assert!(matches!(report.violation, Some(InvariantViolation::AuthorizationViolated { .. })));
+        
+        if let Some(v) = report.violation {
+            assert_eq!(v.severity(), Severity::High);
+            assert_eq!(v.remediation(), "Review access control policy. Revoke compromised roles.");
         }
     }
 }
