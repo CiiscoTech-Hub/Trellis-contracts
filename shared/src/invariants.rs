@@ -1,3 +1,4 @@
+//! # Threat Model: Cross-Boundary Trust Decisions (Scenario-Based)
 //! # Asset Conservation Invariant Proof Engine
 //!
 //! Formal verification and invariant testing framework for Trellis smart contracts.
@@ -5,6 +6,76 @@
 //! misallocated across any supported protocol state transition.
 //!
 //! ## Mathematical Axioms
+//!
+//! 1. **Global Conservation Axiom**:
+//!
+//! ## Scenario-Based Threat Model
+//!
+//! ### Trust Boundaries
+//! - **B1: External Caller -> Contract Entry Point**: Untrusted caller invokes
+//!   deposit/withdraw/escrow/aid/referral/governance/oracle/marketplace entrypoints.
+//! - **B2: Contract -> SAC Token**: Contract trusts SAC token semantics (no rebasing,
+//!   no fee-on-transfer, no reentrancy via token callbacks).
+//! - **B3: Contract -> Oracle Feed**: Contract trusts oracle price/attestation freshness
+//!   and authenticity.
+//! - **B4: Contract -> Governance**: Contract trusts governance proposal execution to
+//!   respect timelocks and quorum.
+//! - **B5: Contract -> Marketplace Counterparty**: Contract trusts escrow settlement
+//!   ordering and ownership transfer atomicity.
+//! - **B6: Contract -> Referral/Aid Beneficiary**: Contract trusts beneficiary identity
+//!   binding and one-time claim semantics.
+//!
+//! ### Abuse Cases (highest-risk paths)
+//! - **AC-1 (B1/B2)**: Reentrancy during withdrawal drains reserve while liabilities
+//!   still reflect the pre-withdrawal amount -> `SolvencyBackingMismatched`.
+//! - **AC-2 (B1/B2)**: Fee-on-transfer token silently reduces contract reserve below
+//!   internal liabilities -> `SolvencyBackingMismatched`.
+//! - **AC-3 (B1/B5)**: Escrow settlement double-claims the same record -> liabilities
+//!   decremented twice, reserve decremented once -> `AssetConservationViolated`.
+//! - **AC-4 (B1/B6)**: Aid claim by non-beneficiary -> `AuthorizationViolated`.
+//! - **AC-5 (B1/B3)**: Stale oracle price used for marketplace settlement ->
+//!   `LifecycleViolated` / mispriced settlement.
+//! - **AC-6 (B1/B4)**: Governance proposal executed without timelock ->
+//!   `AuthorizationViolated`.
+//! - **AC-7 (B1)**: Negative balance via integer underflow in referral payout ->
+//!   `ImpossibleBalanceDetected`.
+//! - **AC-8 (B1/B5)**: Ownership transfer to attacker address ->
+//!   `OwnershipViolated`.
+//!
+//! ### Mitigations
+//! - M1: Checks-effects-interactions ordering + reentrancy guard on all token-moving
+//!   entrypoints (addresses AC-1).
+//! - M2: Reject tokens whose observed delta != requested amount (addresses AC-2).
+//! - M3: Idempotent settlement keyed by record id; lifecycle state machine gate
+//!   (addresses AC-3, AC-5).
+//! - M4: `require_auth` on beneficiary/donor/governance actor (addresses AC-4, AC-6).
+//! - M5: Checked arithmetic (`checked_add`/`checked_sub`) on all balance mutations
+//!   (addresses AC-7).
+//! - M6: Ownership transition requires current-owner auth + explicit accept
+//!   (addresses AC-8).
+//! - M7: Oracle freshness window enforced before settlement (addresses AC-5).
+//!
+//! ### Operational Edge Cases & Failure Modes
+//! - Oracle outage: settlement must revert, not use last-known price beyond window.
+//! - Token contract upgrade changing transfer semantics: monitor detects reserve
+//!   drift; halt via `InvariantMonitor`.
+//! - Governance emergency pause: all token-moving entrypoints must short-circuit
+//!   before any state mutation.
+//! - Partial batch settlement failure: entire batch must revert (reversion
+//!   invariance).
+//!
+//! ### Rollback / Recovery
+//! - On `Severity::Critical` violation: halt module, snapshot state, reconcile
+//!   physical reserve vs internal liabilities, then resume only after root cause
+//!   fix and re-run of `monitor_tests`.
+//! - On `Severity::High`: pause affected record updates, revoke compromised roles,
+//!   replay from last known-good ledger using reversion invariance checks.
+//!
+//! ### Verification
+//! - `monitor_tests` exercises each abuse case via `mutations` fixtures and asserts
+//!   the expected `InvariantViolation` variant and `Severity`.
+//!
+//! ## Mathematical Axioms (continued)
 //!
 //! 1. **Global Conservation Axiom**:
 //!    For any state transition $\tau: S_t \to S_{t+1}$, the total quantity of tokens
@@ -31,6 +102,7 @@
 extern crate std;
 use std::format;
 use std::string::String;
+use std::vec;
 use std::vec::Vec;
 
 use soroban_sdk::{token, Address, Env};
@@ -460,7 +532,7 @@ pub mod mutations {
 #[cfg(test)]
 mod monitor_tests {
     use super::*;
-    use soroban_sdk::Address;
+    use soroban_sdk::{testutils::Address as _, Address};
 
     #[test]
     fn test_conservation_invariant_passes() {

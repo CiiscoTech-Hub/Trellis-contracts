@@ -70,5 +70,221 @@
     "migration_notes": "",
     "issue": 192,
     "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-10-16",
+    "impact": "compatible",
+    "summary": "Added operator-safe backfill tool with dry-run diff preview, resumable checkpoints, rollback support, and detailed skipped/failed record reporting across treasury, aid, referral, governance, oracle, and marketplace modules (Issue #217).",
+    "migration_notes": "",
+    "issue": 217,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-10-16",
+    "impact": "compatible",
+    "summary": "Added data minimization review and retention enforcement for operational metadata across Treasury, Aid, Referral, Governance, Oracle, and Marketplace modules with two-phase deletion, holds, and migration adapters (Issue #229).",
+    "migration_notes": "",
+    "issue": 229,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-10-16",
+    "impact": "compatible",
+    "summary": "Added release readiness gate and automated verification for migrations, security checks, smoke tests, and rollback rehearsals across Treasury, Aid, Referral, Governance, Oracle, and Marketplace modules (Issue #253).",
+    "migration_notes": "",
+    "issue": 253,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-10-17",
+    "impact": "compatible",
+    "summary": "Added shared::audit_ledger: an append-only hash-chained ledger for privileged and financial events with on-chain verify_chain, bounded permissioned export_ledger, storage-free verify_export, and a head checkpoint anchor (Issue #233).",
+    "migration_notes": "",
+    "issue": 233,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-10-17",
+    "impact": "compatible",
+    "summary": "Added accessibility coverage for keyboard navigation, focus management, roving tabindex, and async contract status state mapping to ARIA live regions in shared::accessibility (Issue #296).",
+    "migration_notes": "",
+    "issue": 296,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-10-17",
+    "impact": "compatible",
+    "summary": "Added contributor diagnostics for toolchain, dependency invariant validation, contract storage schemas, and workspace fixture health in shared::diagnostics and scripts/contributor-diagnostics.cjs (Issue #297).",
+    "migration_notes": "",
+    "issue": 297,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-10-17",
+    "impact": "compatible",
+    "summary": "Implemented explainable risk scoring for suspicious high-impact actions with transparent factor vectors, configurable policies, and actionable verdicts in shared::risk_scoring (Issue #298).",
+    "migration_notes": "",
+    "issue": 298,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-10-17",
+    "impact": "compatible",
+    "summary": "Added release readiness checks for schema migrations, deployment smoke tests, automated rollback rehearsals, and dual-admin signoff in shared::release_readiness (Issue #299).",
+    "migration_notes": "",
+    "issue": 299,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-10-17",
+    "impact": "compatible",
+    "summary": "Implemented permission-aware export pipeline with bounded memory streaming, in-flight cancellation, multi-module role authorization (Treasury, Aid, Referral, Governance, Oracle, Marketplace), and forbidden field purging in shared::export.",
+    "migration_notes": "",
+    "issue": 300,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-10-18",
+    "impact": "compatible",
+    "summary": "Added external dependency degradation matrix with failure modes, tiered degradation levels, user-safe fallback strategies, automated verification checks, and recovery receipts in shared::degradation (Issue #231).",
+    "migration_notes": "",
+    "issue": 231,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-10-18",
+    "impact": "compatible",
+    "summary": "Implemented risk-scored abuse detection for suspicious high-impact operations with explainable risk signals, strike accumulation, step-up dual-authorization review, velocity throttling, and safe low-risk allowance in shared::abuse and shared::risk_scoring (Issue #242).",
+    "migration_notes": "",
+    "issue": 242,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-10-18",
+    "impact": "compatible",
+    "summary": "Implemented policy simulation preview framework before committing irreversible or high-impact changes, previewing affected records and users, expected operational side effects, and rollback constraints in shared::policy_preview (Issue #250).",
+    "migration_notes": "",
+    "issue": 250,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-10-21",
+    "impact": "compatible",
+    "summary": "Implemented signed, hash-chained state snapshot export for audit/debugging: Ed25519 signer registry, per-module chained capture, chain re-derivation, and a bounded storage-free-verifiable export bundle in shared::snapshot (Issue #301).",
+    "migration_notes": "",
+    "issue": 301,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-10-21",
+    "impact": "compatible",
+    "summary": "Implemented authorized dependency health-check reporting and a retry/circuit-breaker budget for degraded-mode fallback: admin-managed reporter registry and a bounded retry budget in shared::health_guard (#334).",
+    "migration_notes": "",
+    "issue": 334,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-10-21",
+    "impact": "compatible",
+    "summary": "Implemented dead-letter recovery for failed domain-event handlers: captures handler failures instead of propagating them, a permissionless backoff retry, and admin-gated requeue/discard in shared::event_dead_letter (#335).",
+    "migration_notes": "",
+    "issue": 335,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-10-21",
+    "impact": "compatible",
+    "summary": "Implemented request validation for cross-repo Trellis clients: schema-version checks, field/semantic validation, caller-identity authorization, and a generic idempotent retry wrapper in shared::client_validation (#336).",
+    "migration_notes": "",
+    "issue": 336,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-10-21",
+    "impact": "compatible",
+    "summary": "Implemented rollback verification for failed multi-step/cross-contract initialization: tracked steps, operator-probe verification, and the only gated path to a verified RolledBack state in shared::init_rollback (#337).",
+    "migration_notes": "",
+    "issue": 337,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-10-21",
+    "impact": "compatible",
+    "summary": "Implemented bounded iteration protection for storage scans: a hard ceiling on shared::pagination's max_scan, an admin-configurable per-scope limit, and a generic resumable offset scan in shared::scan_guard (#338).",
+    "migration_notes": "",
+    "issue": 338,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-10-21",
+    "impact": "compatible",
+    "summary": "Implemented batch partial-failure reporting and retry on shared::batch: an addressable per-recipient failure report, and a forced non-atomic retry of just the retryable entries in shared::batch_retry (#339).",
+    "migration_notes": "",
+    "issue": 339,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-10-21",
+    "impact": "compatible",
+    "summary": "Implemented an on-chain, queryable protocol changelog complementing changelog/entries.json: admin-gated, immutable entries with a supersedes correction path in shared::protocol_changelog (#340).",
+    "migration_notes": "",
+    "issue": 340,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-10-21",
+    "impact": "compatible",
+    "summary": "Added next-version schema migration checks: read-only check_schema_migration and admin-gated, idempotent commit_schema_migration, which stamps a version only after a completed journal for that exact plan (#262).",
+    "migration_notes": "",
+    "issue": 262,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-10-21",
+    "impact": "compatible",
+    "summary": "Added shared::degraded_mode::guard_operation: while a dependency is degraded, new-fund entry operations are refused with DependencyDegraded before any write, exits are never blocked, and reads are flagged read-only (#265).",
+    "migration_notes": "",
+    "issue": 265,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-10-21",
+    "impact": "breaking",
+    "summary": "The aid contract enforces balance, ownership, and entitlement invariants on every transition; claim_aid/refund_aid reject milestone programs and escrow inflows with a short balance delta fail with InvariantViolation (118) (#266).",
+    "migration_notes": "Clients must claim and refund milestone programs with claim_aid_milestone and refund_milestone_aid; claim_aid/refund_aid now return InvalidArgument (111) for them. Indexers should expect status PartiallyClaimed on milestone records and handle the new AidError::InvariantViolation (118). refund_milestone_aid now also returns verified-but-unclaimed tranches to the donor, and delete_aid rejects partially claimed records with CannotDeletePending. No storage migration is needed: existing milestone records are re-derived from their stored tranches on the next claim or refund.",
+    "issue": 266,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-10-21",
+    "impact": "compatible",
+    "summary": "Added event dead-letter operator tooling: bounded list_event_dead_letters with status and due-ledger filters, event_dead_letter_summary, admin bulk requeue_dead_letters with per-id outcomes, and scripts/dead-letter-ops.cjs (#267).",
+    "migration_notes": "",
+    "issue": 267,
+    "pr": null
   }
 ]

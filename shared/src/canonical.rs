@@ -15,6 +15,12 @@
 //! - [`canonical_fingerprint`] — `sha256(canonical_bytes)` for signing/hashing.
 //! - [`canonicalize_legacy`] — migrates legacy `key=value` payloads onto the
 //!   same canonical form so pre-existing records stay verifiable.
+//! - [`normalize_text_strict`] / [`canonical_bytes_strict`] — the verifier
+//!   side. They accept only input that is already canonical and reject
+//!   anything that would have to be rewritten, so a signed payload has exactly
+//!   one accepted byte form.
+//! - [`verify_canonical_fingerprint`] — strict check of a payload against an
+//!   expected fingerprint (signature or hash comparison).
 //!
 //! ## Encoding version
 //!
@@ -125,6 +131,81 @@ pub fn normalize_int(env: &Env, value: i128) -> Bytes {
         buf[i] = b'-';
     }
     Bytes::from_slice(env, &buf[i..])
+}
+
+/// Maximum number of parts a strictly-verified payload may carry.
+pub const MAX_CANONICAL_PARTS: u32 = 32;
+
+/// Strict counterpart of [`normalize_text`].
+///
+/// Accepts `raw` only when it is already in canonical form: non-empty,
+/// printable ASCII with single interior spaces, no leading or trailing space,
+/// and no upper-case letters. Anything that [`normalize_text`] would rewrite
+/// (casing, tabs, newlines, doubled or edge spaces, control or non-ASCII
+/// bytes) returns [`Error::InvalidArgument`] instead of being silently fixed.
+pub fn normalize_text_strict(_env: &Env, raw: &Bytes) -> Result<Bytes, Error> {
+    if raw.is_empty() || raw.len() > MAX_FIELD_LEN {
+        return Err(Error::InvalidArgument);
+    }
+    // Starts `true` so a leading space is rejected.
+    let mut prev_space = true;
+    for i in 0..raw.len() {
+        let b = raw.get(i).ok_or(Error::InvalidArgument)?;
+        if b == b' ' {
+            if prev_space {
+                return Err(Error::InvalidArgument);
+            }
+            prev_space = true;
+            continue;
+        }
+        if !(0x21..=0x7e).contains(&b) || b.is_ascii_uppercase() {
+            return Err(Error::InvalidArgument);
+        }
+        prev_space = false;
+    }
+    // A trailing space leaves `prev_space` set.
+    if prev_space {
+        return Err(Error::InvalidArgument);
+    }
+    Ok(raw.clone())
+}
+
+/// Strict counterpart of [`canonical_bytes`].
+///
+/// Every text part must already be canonical (see [`normalize_text_strict`])
+/// and the part count is capped at [`MAX_CANONICAL_PARTS`], so a verifier can
+/// never accept a payload that a signer would have to rewrite first.
+pub fn canonical_bytes_strict(env: &Env, parts: &Vec<CanonicalPart>) -> Result<Bytes, Error> {
+    if parts.len() > MAX_CANONICAL_PARTS {
+        return Err(Error::InvalidArgument);
+    }
+    for i in 0..parts.len() {
+        if let CanonicalPart::Text(t) = parts.get(i).ok_or(Error::InvalidArgument)? {
+            normalize_text_strict(env, &t)?;
+        }
+    }
+    canonical_bytes(env, parts)
+}
+
+/// Verifies that `parts` strictly canonicalize to `expected`.
+///
+/// Returns [`Error::InvalidArgument`] when the input is not canonical, and
+/// [`Error::Unauthorized`] when a canonical payload does not match the expected
+/// fingerprint. Callers that treat a fingerprint as a signature should map a
+/// mismatch to an authorization failure, which is what this error signals.
+pub fn verify_canonical_fingerprint(
+    env: &Env,
+    parts: &Vec<CanonicalPart>,
+    expected: &BytesN<32>,
+) -> Result<(), Error> {
+    let actual = env
+        .crypto()
+        .sha256(&canonical_bytes_strict(env, parts)?)
+        .to_bytes();
+    if actual != *expected {
+        return Err(Error::Unauthorized);
+    }
+    Ok(())
 }
 
 fn encode_part(env: &Env, part: &CanonicalPart) -> Result<Bytes, Error> {

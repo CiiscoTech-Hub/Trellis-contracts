@@ -866,4 +866,64 @@ mod tests {
         assert!(names.iter().any(|n| n == name1));
         assert!(names.iter().any(|n| n == name2));
     }
+
+    #[test]
+    fn worst_case_registry_reads_stay_within_budget() {
+        const CPU_LIMIT: u64 = 10_000_000;
+        const MEMORY_LIMIT: u64 = 2_000_000;
+
+        let env = Env::default();
+        env.mock_all_auths();
+        let registry_id = env.register_contract(None, RegistryContract);
+        let admin = Address::generate(&env);
+        let registry = RegistryContractClient::new(&env, &registry_id);
+        registry.initialize(&admin);
+
+        // Fill the directory to its supported high-cardinality limit before
+        // measuring the full list/search read.
+        for index in 0..MAX_REGISTRY_ENTRIES {
+            let name = Symbol::new(&env, &std::format!("c{index}"));
+            let address = Address::generate(&env);
+            registry.set_contract(&admin, &name, &address, &1);
+        }
+
+        env.budget().reset_unlimited();
+        let cpu_before = env.budget().cpu_instruction_cost();
+        let memory_before = env.budget().memory_bytes_cost();
+        let names = registry.list_names();
+        let cpu = env.budget().cpu_instruction_cost().saturating_sub(cpu_before);
+        let memory = env.budget().memory_bytes_cost().saturating_sub(memory_before);
+        assert_eq!(names.len(), MAX_REGISTRY_ENTRIES);
+        assert!(
+            cpu <= CPU_LIMIT,
+            "full registry scan used {cpu} CPU instructions (limit {CPU_LIMIT})"
+        );
+        assert!(
+            memory <= MEMORY_LIMIT,
+            "full registry scan used {memory} memory bytes (limit {MEMORY_LIMIT})"
+        );
+
+        // A single key can also accumulate a full supported ledger history.
+        let history_name = Symbol::new(&env, "history");
+        for version in 1..=MAX_VERSION_HISTORY {
+            let address = Address::generate(&env);
+            registry.set_contract(&admin, &history_name, &address, &version);
+        }
+
+        env.budget().reset_unlimited();
+        let cpu_before = env.budget().cpu_instruction_cost();
+        let memory_before = env.budget().memory_bytes_cost();
+        let history = registry.get_version_history(&history_name);
+        let cpu = env.budget().cpu_instruction_cost().saturating_sub(cpu_before);
+        let memory = env.budget().memory_bytes_cost().saturating_sub(memory_before);
+        assert_eq!(history.len(), MAX_VERSION_HISTORY);
+        assert!(
+            cpu <= CPU_LIMIT,
+            "full version-history read used {cpu} CPU instructions (limit {CPU_LIMIT})"
+        );
+        assert!(
+            memory <= MEMORY_LIMIT,
+            "full version-history read used {memory} memory bytes (limit {MEMORY_LIMIT})"
+        );
+    }
 }

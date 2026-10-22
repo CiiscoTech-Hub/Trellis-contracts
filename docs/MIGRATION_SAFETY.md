@@ -157,3 +157,95 @@ Pre-migration snapshot: <ledger / backup reference>
 Forward-fix PR:     <link>
 Escalation:         <who / where>
 ```
+
+## Cross-contract dry run (Issue #332)
+
+A migration that spans several contracts (for example Aid and Treasury) should
+be previewed as one batch with `shared::migration::dry_run_cross_contract`.
+It takes one `ContractMigrationPlan` per contract and returns a
+`CrossContractDryRunReport`:
+
+| Field | Meaning |
+|---|---|
+| `batch_valid` | `true` only when the batch is non-empty and every plan is valid and unique |
+| `affected_records` / `destructive_steps` | Totals across the valid plans only (saturating) |
+| `requires_approval` | `true` when any contract in the batch has a destructive step |
+| `first_invalid` | First contract whose plan is invalid or duplicated |
+| `per_contract` | Each contract's own `DryRunReport`, in the order supplied |
+
+Operational edge cases:
+
+- **Duplicate contract in a batch.** The second entry is reported as
+  `InvalidPlan`, and the batch is invalid. This stops one contract's migration
+  from being staged twice.
+- **Empty batch.** Never valid, so a release cannot pass by migrating nothing.
+- **One invalid plan.** The batch is invalid. Totals still count the valid
+  plans so operators can see the blast radius, but `batch_valid` is `false`, so
+  nothing should be staged until the invalid plan is fixed.
+
+The function is pure and reads or writes no storage, so it is safe on a read
+path and in simulations.
+
+## Next-version compatibility checks (Issue #262)
+
+`shared::storage_version::upgrade_storage_schema` bumps the stored version on
+its own, so nothing stops a version being stamped before its data migration
+has run, or a build stamping a version it cannot read. Two functions close
+that gap for the next schema version:
+
+- `check_schema_migration(&env, &plan) -> SchemaMigrationReport` is a
+  read-only preflight to run before `begin_migration`.
+- `commit_schema_migration(&env, &admin, &plan) -> Result<u32, Error>` is the
+  admin-gated final step. It stamps `plan.to_version` only when the same rules
+  pass and the journal records a `Completed` run of exactly this plan.
+
+A missing stored version is read as legacy V1, the same as
+`upgrade_storage_schema`.
+
+| `SchemaCompatibility` | Meaning | Operator action |
+|---|---|---|
+| `Compatible` | `plan` is exactly `stored -> stored + 1` and this build reads the target | Stage with `begin_migration` |
+| `AlreadyAtTarget` | Stored version is already at or past `plan.to_version` | Nothing to do; a repeated commit returns `Ok` |
+| `SourceUnsupported` | Stored version is outside this build's readable range | Deploy a build that reads it before migrating |
+| `InvalidPlan` | `MigrationPlan::validate` fails | Fix the plan |
+| `PlanSourceMismatch` | `plan.from_version` is not the stored version | Rebuild the plan from the live version |
+| `NotNextVersion` | Plan skips a version | Split into single-version hops |
+| `TargetUnsupported` | This build cannot read `plan.to_version` | Upgrade the WASM first, then migrate |
+| `MigrationInProgress` | Another journal is `InProgress` | Finish, fail, or clear it first |
+
+Commit errors: `Unauthorized` (not the admin), `UnsupportedSchemaVersion`
+(source or target unreadable), `InvalidArgument` (any other plan rule),
+`NotFound` (no journal), `InvalidTransition` (journal not `Completed`, or
+recorded for a different `from`/`to`).
+
+### Sequence
+
+1. Upgrade the WASM to a build whose `MAX_SUPPORTED_STORAGE_SCHEMA_VERSION`
+   includes the next version. In Soroban the new code only takes effect after
+   the upgrading invocation completes, so the migration always runs in a
+   later transaction.
+2. `check_schema_migration` returns `Compatible`.
+3. `begin_migration`, then `mark_step_complete` for each step, then
+   `finish_migration` with passing post-checks.
+4. `commit_schema_migration` stamps the version and emits
+   `(storage, sch_upg)`.
+
+### Edge cases, retry, and rollback
+
+- **The commit transaction is resubmitted.** It returns `Ok(to_version)` and
+  writes nothing.
+- **A post-check fails.** The journal is `Failed` and the commit is refused,
+  so the stored version never changes. Readers keep the old, still-supported
+  version and the plan's `RollbackStrategy` applies.
+- **Rollback before commit.** Redeploying the previous WASM is safe, because
+  the stored version was never bumped.
+- **Rollback after commit.** The previous build cannot read the new version:
+  its guards return `UnsupportedSchemaVersion`. Fix forward, or ship a build
+  that reads both versions.
+- **Existing callers.** `upgrade_storage_schema` and the aid contract's admin
+  endpoint are unchanged. Contracts adopt the gated path by calling
+  `commit_schema_migration` from their admin entry point.
+
+```bash
+cargo test -p shared storage_version
+```

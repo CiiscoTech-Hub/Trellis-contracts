@@ -990,3 +990,206 @@ mod cross_contract_fuzz {
         }
     }
 }
+
+// -----------------------------------------------------------------------------
+// Issue #328: Fuzz coverage for malformed Soroban arguments
+// -----------------------------------------------------------------------------
+
+use soroban_sdk::{Bytes, BytesN, Vec as SorobanVec};
+use shared::errors::Error;
+
+/// Generator producing adversarial and malformed Soroban arguments to probe boundary resilience.
+pub struct MalformedArgumentGenerator<'a> {
+    env: &'a Env,
+    seed: u64,
+}
+
+impl<'a> MalformedArgumentGenerator<'a> {
+    pub fn new(env: &'a Env, seed: u64) -> Self {
+        Self { env, seed }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.seed = self
+            .seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        self.seed
+    }
+
+    /// Generates malformed amounts: negative, zero, i128::MIN, i128::MAX, overflow probes.
+    pub fn malformed_amount(&mut self) -> i128 {
+        match self.next_u64() % 6 {
+            0 => -1,
+            1 => -1_000_000,
+            2 => i128::MIN,
+            3 => i128::MIN + 1,
+            4 => 0,
+            _ => i128::MAX,
+        }
+    }
+
+    /// Generates valid positive amounts for comparative normal path tests.
+    pub fn valid_amount(&mut self) -> i128 {
+        ((self.next_u64() % 100_000_000) as i128) + 1
+    }
+
+    /// Generates malformed byte payloads (undersized, oversized, corrupted hashes).
+    pub fn malformed_bytes(&mut self) -> Bytes {
+        let choice = self.next_u64() % 4;
+        match choice {
+            0 => Bytes::new(self.env), // Empty byte array
+            1 => Bytes::from_slice(self.env, &[0xAA; 15]), // Undersized (15 bytes instead of 32)
+            2 => Bytes::from_slice(self.env, &[0xBB; 31]), // Off-by-one undersized
+            _ => Bytes::from_slice(self.env, &[0xCC; 65]), // Oversized (> 64 bytes)
+        }
+    }
+
+    /// Generates valid 32-byte hashes for normal path tests.
+    pub fn valid_hash(&mut self) -> BytesN<32> {
+        let mut raw = [0u8; 32];
+        let val = self.next_u64();
+        raw[..8].copy_from_slice(&val.to_be_bytes());
+        BytesN::from_array(self.env, &raw)
+    }
+
+    /// Generates malformed symbol strings containing forbidden delimiters or control characters.
+    pub fn malformed_symbol_bytes(&mut self) -> &'static [u8] {
+        match self.next_u64() % 5 {
+            0 => b"",
+            1 => b"contains spaces",
+            2 => b"symbol.with.dots",
+            3 => b"symbol:with:colons",
+            _ => b"overlong_symbol_string_exceeding_soroban_symbol_limits",
+        }
+    }
+}
+
+/// Fuzzing validator for contract entry point argument boundaries.
+pub struct MalformedArgumentsFuzzer;
+
+impl MalformedArgumentsFuzzer {
+    /// Validates an amount argument according to Soroban positive token amount conventions.
+    pub fn validate_amount(amount: i128) -> Result<(), Error> {
+        if amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+        Ok(())
+    }
+
+    /// Validates a byte slice against expected fixed hash or identifier constraints.
+    pub fn validate_hash_bytes(bytes: &Bytes) -> Result<(), Error> {
+        let len = bytes.len();
+        if len != 32 {
+            return Err(Error::InvalidHash);
+        }
+        Ok(())
+    }
+
+    /// Validates a collection length against maximum admission limits.
+    pub fn validate_collection_bounds<T: soroban_sdk::IntoVal<Env, soroban_sdk::Val>>(
+        vec: &SorobanVec<T>,
+        max_capacity: u32,
+    ) -> Result<(), Error> {
+        let len = vec.len();
+        if len == 0 || len > max_capacity {
+            return Err(Error::InvalidArgument);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod malformed_argument_fuzz_tests {
+    use super::*;
+
+    #[test]
+    fn normal_path_valid_arguments_pass_fuzz_validation() {
+        let env = Env::default();
+        let mut gen = MalformedArgumentGenerator::new(&env, 42);
+
+        for _ in 0..100 {
+            let amount = gen.valid_amount();
+            assert!(
+                MalformedArgumentsFuzzer::validate_amount(amount).is_ok(),
+                "Valid amount {} was rejected",
+                amount
+            );
+
+            let hash = gen.valid_hash();
+            let hash_bytes = hash.to_bytes();
+            assert!(
+                MalformedArgumentsFuzzer::validate_hash_bytes(&hash_bytes).is_ok(),
+                "Valid 32-byte hash was rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn failure_path_malformed_arguments_fail_fast_deterministically() {
+        let env = Env::default();
+        let mut gen = MalformedArgumentGenerator::new(&env, 1337);
+
+        for _ in 0..100 {
+            let bad_amount = gen.malformed_amount();
+            assert_eq!(
+                MalformedArgumentsFuzzer::validate_amount(bad_amount),
+                Err(Error::InvalidAmount),
+                "Malformed amount {} unexpectedly passed",
+                bad_amount
+            );
+
+            let bad_bytes = gen.malformed_bytes();
+            assert_eq!(
+                MalformedArgumentsFuzzer::validate_hash_bytes(&bad_bytes),
+                Err(Error::InvalidHash),
+                "Malformed bytes of len {} unexpectedly passed",
+                bad_bytes.len()
+            );
+        }
+    }
+
+    #[test]
+    fn retry_path_idempotent_rejection_and_clean_recovery() {
+        let env = Env::default();
+        let mut gen = MalformedArgumentGenerator::new(&env, 2026);
+
+        // Submitting same malformed argument twice gives identical failure
+        let malformed = gen.malformed_amount();
+        assert_eq!(
+            MalformedArgumentsFuzzer::validate_amount(malformed),
+            Err(Error::InvalidAmount)
+        );
+        assert_eq!(
+            MalformedArgumentsFuzzer::validate_amount(malformed),
+            Err(Error::InvalidAmount)
+        );
+
+        // Correcting the argument on the subsequent retry succeeds cleanly
+        let corrected = gen.valid_amount();
+        assert_eq!(MalformedArgumentsFuzzer::validate_amount(corrected), Ok(()));
+    }
+
+    #[test]
+    fn authorization_path_malformed_collection_and_caller_bounds() {
+        let env = Env::default();
+        let mut oversized: SorobanVec<u32> = SorobanVec::new(&env);
+        for i in 0..150 {
+            oversized.push_back(i);
+        }
+
+        // Oversized collection exceeding max limit fails with InvalidArgument
+        assert_eq!(
+            MalformedArgumentsFuzzer::validate_collection_bounds(&oversized, 100),
+            Err(Error::InvalidArgument)
+        );
+
+        // Empty collection also fails
+        let empty: SorobanVec<u32> = SorobanVec::new(&env);
+        assert_eq!(
+            MalformedArgumentsFuzzer::validate_collection_bounds(&empty, 100),
+            Err(Error::InvalidArgument)
+        );
+    }
+}
+

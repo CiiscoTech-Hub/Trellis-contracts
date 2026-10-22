@@ -126,3 +126,46 @@ cargo test -p treasury-contract invariants_test
 # Run all invariant tests across the workspace
 cargo test invariants_test
 ```
+
+---
+
+## 7. Runtime Transition Checks in the Aid Contract (Issue #266)
+
+The suites above check invariants from outside, after a call. The aid
+contract now also enforces them inside every balance, ownership, and
+entitlement transition
+([`contracts/aid-contract/src/transitions.rs`](../contracts/aid-contract/src/transitions.rs)),
+so a violating call is rejected and rolled back instead of only being
+detected later.
+
+| Invariant | Check | Paths |
+|---|---|---|
+| Balance (Axiom II) | `escrow_in`: the contract's token balance must rise by exactly the recorded amount, otherwise `InvariantViolation` (118) | `create_aid`, `batch_create_aid`, `create_milestone_aid` |
+| Ownership | `commit`: donor, recipient, token, amount, and tranche count are immutable | every status change |
+| Lifecycle | `commit`: `Settled` and `Refunded` are terminal; status only moves forward | every status change |
+| Entitlement | `settle_milestones`: tranches must sum to the escrowed amount; status is derived from what is still unclaimed | `claim_aid_milestone`, `refund_milestone_aid` |
+
+### Defects closed
+
+| Before | After |
+|---|---|
+| `claim_aid` on a milestone program paid out the whole escrow without inspector verification, after which the tranches could be claimed again, draining other records' escrow | `InvalidArgument`; tranches are claimed only through `claim_aid_milestone` |
+| `refund_aid` on a milestone program refunded the full amount, including tranches already paid | `InvalidArgument`; use `refund_milestone_aid` |
+| `claim_aid_milestone` never changed the record's status | `PartiallyClaimed` while tranches remain, `Settled` when none remain |
+| `refund_milestone_aid` left verified-but-unclaimed tranches in the contract forever (claims close at expiry) | Every unclaimed tranche is refunded; a fully claimed program returns `AlreadyClaimed` |
+| `delete_aid` could delete a partially claimed record that still held escrow | `CannotDeletePending` |
+| A fee-on-transfer token under-backed new liabilities (§5.2) | Rejected at escrow time with `InvariantViolation` |
+
+**Migration.** No storage migration is needed. Milestone records created
+before this change still read `Pending`; their status is recomputed from the
+stored tranches on the next claim or refund.
+
+**Recovery.** A rejected transition writes nothing, so the caller retries
+once the precondition holds; for example, an unverified tranche can be
+claimed after an inspector verifies it. If `InvariantViolation` comes from
+`settle_milestones`, stored tranches disagree with the record: pause the
+contract and reconcile the record against token balances before resuming.
+
+```bash
+cargo test -p aid-contract transitions
+```
