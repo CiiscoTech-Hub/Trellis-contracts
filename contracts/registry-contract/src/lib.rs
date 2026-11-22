@@ -27,10 +27,11 @@
 //! For full API details, see the module items below.
 
 use shared::events::{emit_action_executed, emit_module_initialized};
-use shared::storage::{persistent_get, persistent_read, persistent_set};
+use shared::storage::{persistent_get, persistent_read, persistent_remove, persistent_set};
 use shared::{auth, errors::Error};
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, Bytes, Env, Map, Symbol, Vec,
+    contract, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN, Env, Map, Symbol,
+    Vec,
 };
 
 // Storage keys
@@ -41,6 +42,9 @@ const KEY_NAMES: Symbol = symbol_short!("names");
 const KEY_META_NAMES: Symbol = symbol_short!("meta_nms");
 const KEY_DEACTIVATED: Symbol = symbol_short!("deact");
 const KEY_DEACT_HIST: Symbol = symbol_short!("deacth");
+const KEY_PINNED: Symbol = symbol_short!("pinned");
+const KEY_DEPRECATION: Symbol = symbol_short!("deprec");
+const KEY_VER_REG: Symbol = symbol_short!("ver_reg");
 
 /// Bound global registry scans so getters and writes stay within Soroban
 /// execution budgets. Version history is independently bounded per name.
@@ -95,6 +99,13 @@ pub struct DeactivationState {
 #[contract]
 pub struct RegistryContract;
 
+/// The registry contract does not accept a caller-supplied correlation ID
+/// (registration is not tied to a request-scoped workflow), so every
+/// correlated event uses the canonical zero correlation ID.
+fn zero_correlation_id(env: &Env) -> BytesN<32> {
+    BytesN::from_array(env, &[0; 32])
+}
+
 #[contractimpl]
 impl RegistryContract {
     // ─── Initialization ──────────────────────────────────────────────────────
@@ -104,6 +115,7 @@ impl RegistryContract {
         auth::initialize_admin(&env, &admin)?;
         emit_module_initialized(
             &env,
+            &zero_correlation_id(&env),
             symbol_short!("registry"),
             1,
             &admin,
@@ -156,6 +168,14 @@ impl RegistryContract {
                 version,
             },
         );
+        persistent_set(
+            &env,
+            &(KEY_VER_REG, (name.clone(), version)),
+            &ContractRegistration {
+                address: address.clone(),
+                version,
+            },
+        );
         push_unique_symbol(&env, &KEY_NAMES, &name);
 
         // Check the latest version first to avoid deserializing the full
@@ -167,6 +187,7 @@ impl RegistryContract {
 
         emit_action_executed(
             &env,
+            &zero_correlation_id(&env),
             symbol_short!("registry"),
             symbol_short!("set_ctr"),
             &caller,
@@ -224,6 +245,7 @@ impl RegistryContract {
 
         emit_action_executed(
             &env,
+            &zero_correlation_id(&env),
             symbol_short!("registry"),
             symbol_short!("deact"),
             &caller,
@@ -259,6 +281,7 @@ impl RegistryContract {
 
         emit_action_executed(
             &env,
+            &zero_correlation_id(&env),
             symbol_short!("registry"),
             symbol_short!("react"),
             &caller,
@@ -306,7 +329,67 @@ impl RegistryContract {
         schema_version: u32,
     ) -> Result<(), Error> {
         auth::require_admin(&env, &caller)?;
+        Self::write_metadata(env, name, uri, hash, immutable, schema_version)
+    }
 
+    /// Register or update metadata only if nobody changed it since the caller
+    /// read it (optimistic concurrency for concurrent editors, Issue #478).
+    ///
+    /// # Arguments
+    /// * `expected_hash` - The `hash` the caller last read for `name`, or
+    ///   `None` when the caller expects `name` to have no entry yet.
+    /// * The other arguments are the same as for [`RegistryContract::set_metadata`].
+    ///
+    /// # Errors
+    /// * [`Error::Unauthorized`] - `caller` is not the admin. Checked before
+    ///   the stored entry is compared.
+    /// * [`Error::StaleData`] - the stored entry no longer matches
+    ///   `expected_hash`. Re-read it with `get_metadata`, merge, and retry.
+    /// * Any error [`RegistryContract::set_metadata`] returns.
+    ///
+    /// Re-sending an edit that is already stored returns `Ok(())` without
+    /// writing, so retrying after a lost response is safe.
+    // The existing set_metadata arguments plus `expected_hash`; bundling them
+    // into a struct would make this entry point differ from set_metadata.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_metadata_if_match(
+        env: Env,
+        caller: Address,
+        name: Symbol,
+        expected_hash: Option<Bytes>,
+        uri: Bytes,
+        hash: Bytes,
+        immutable: bool,
+        schema_version: u32,
+    ) -> Result<(), Error> {
+        auth::require_admin(&env, &caller)?;
+
+        let current = persistent_read::<_, MetadataEntry>(&env, &(KEY_METADATA, name.clone()));
+        match (current, expected_hash) {
+            (Some(cur), _)
+                if cur.uri == uri
+                    && cur.hash == hash
+                    && cur.immutable == immutable
+                    && cur.schema_version == schema_version =>
+            {
+                return Ok(());
+            }
+            (Some(cur), Some(expected)) if cur.hash == expected => {}
+            (None, None) => {}
+            _ => return Err(Error::StaleData),
+        }
+
+        Self::write_metadata(env, name, uri, hash, immutable, schema_version)
+    }
+
+    fn write_metadata(
+        env: Env,
+        name: Symbol,
+        uri: Bytes,
+        hash: Bytes,
+        immutable: bool,
+        schema_version: u32,
+    ) -> Result<(), Error> {
         ensure_name_capacity(&env, &KEY_META_NAMES, &name)?;
 
         // Check if entry exists and is immutable
@@ -385,6 +468,136 @@ impl RegistryContract {
             }
         }
         Ok(metadata_map)
+    }
+
+    // ─── Version Pinning & Deprecation (Issue #545) ──────────────────────────
+
+    /// Pin resolution of `name` to a specific historical version.
+    pub fn pin_version(
+        env: Env,
+        caller: Address,
+        name: Symbol,
+        version: u32,
+    ) -> Result<(), Error> {
+        auth::require_admin(&env, &caller)?;
+        let versions: Vec<u32> =
+            persistent_get(&env, &(KEY_HISTORY, name.clone())).unwrap_or_else(|| Vec::new(&env));
+        if !versions.iter().any(|v| v == version) {
+            return Err(Error::InvalidArgument);
+        }
+
+        let pin = shared::registry_pinning::VersionPin {
+            name: name.clone(),
+            pinned_version: version,
+            pinned_by: caller.clone(),
+            pinned_at: env.ledger().timestamp(),
+        };
+        persistent_set(&env, &(KEY_PINNED, name), &pin);
+        Ok(())
+    }
+
+    /// Remove the pinned version for `name`, restoring default latest-version resolution.
+    pub fn unpin_version(
+        env: Env,
+        caller: Address,
+        name: Symbol,
+    ) -> Result<(), Error> {
+        auth::require_admin(&env, &caller)?;
+        persistent_remove(&env, &(KEY_PINNED, name));
+        Ok(())
+    }
+
+    /// Get current pinned version for `name` if one exists.
+    pub fn get_pin(env: Env, name: Symbol) -> Option<u32> {
+        persistent_read::<_, shared::registry_pinning::VersionPin>(&env, &(KEY_PINNED, name))
+            .map(|pin| pin.pinned_version)
+    }
+
+    /// Announce a deprecation notice with a future sunset timestamp and optional migration target.
+    pub fn deprecate_contract(
+        env: Env,
+        caller: Address,
+        name: Symbol,
+        version: u32,
+        sunset_at: u64,
+        migration_target: Option<Address>,
+        notice_symbol: Symbol,
+    ) -> Result<(), Error> {
+        auth::require_admin(&env, &caller)?;
+        let current_time = env.ledger().timestamp();
+        if sunset_at <= current_time {
+            return Err(Error::InvalidArgument);
+        }
+
+        let versions: Vec<u32> =
+            persistent_get(&env, &(KEY_HISTORY, name.clone())).unwrap_or_else(|| Vec::new(&env));
+        if !versions.iter().any(|v| v == version) {
+            return Err(Error::InvalidArgument);
+        }
+
+        let notice = shared::registry_pinning::DeprecationNotice {
+            name: name.clone(),
+            version,
+            deprecated_at: current_time,
+            sunset_at,
+            migration_target,
+            notice_symbol,
+        };
+        persistent_set(&env, &(KEY_DEPRECATION, (name, version)), &notice);
+        Ok(())
+    }
+
+    /// Cancel a deprecation notice (e.g. if deprecation was postponed or rolled back).
+    pub fn cancel_deprecation(
+        env: Env,
+        caller: Address,
+        name: Symbol,
+        version: u32,
+    ) -> Result<(), Error> {
+        auth::require_admin(&env, &caller)?;
+        persistent_remove(&env, &(KEY_DEPRECATION, (name, version)));
+        Ok(())
+    }
+
+    /// Query the deprecation notice for a given contract and version.
+    pub fn get_deprecation_notice(
+        env: Env,
+        name: Symbol,
+        version: u32,
+    ) -> Option<shared::registry_pinning::DeprecationNotice> {
+        persistent_read(&env, &(KEY_DEPRECATION, (name, version)))
+    }
+
+    /// Resolve contract address respecting version pinning and deprecation sunset guards.
+    pub fn resolve_contract(env: Env, name: Symbol) -> Result<(Address, u32), Error> {
+        let (latest_addr, latest_ver) = Self::get_contract(env.clone(), name.clone())?;
+        let target_ver = match Self::get_pin(env.clone(), name.clone()) {
+            Some(pinned_ver) => pinned_ver,
+            None => latest_ver,
+        };
+
+        // Check if sunset
+        if let Some(notice) = Self::get_deprecation_notice(env.clone(), name.clone(), target_ver) {
+            if notice.is_sunset(env.ledger().timestamp()) {
+                return Err(Error::ContractNotRegistered);
+            }
+        }
+
+        if target_ver == latest_ver {
+            Ok((latest_addr, latest_ver))
+        } else {
+            // Lookup specific version
+            if let Some(reg) = persistent_read::<_, ContractRegistration>(&env, &(KEY_VER_REG, (name, target_ver))) {
+                Ok((reg.address, reg.version))
+            } else {
+                Err(Error::NotFound)
+            }
+        }
+    }
+
+    /// Lookup historical contract registration for a specific version.
+    pub fn get_contract_version(env: Env, name: Symbol, version: u32) -> Option<ContractRegistration> {
+        persistent_read(&env, &(KEY_VER_REG, (name, version)))
     }
 }
 
@@ -925,5 +1138,166 @@ mod tests {
             memory <= MEMORY_LIMIT,
             "full version-history read used {memory} memory bytes (limit {MEMORY_LIMIT})"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Concurrent metadata edits (Issue #478)
+    // -----------------------------------------------------------------------
+
+    fn hash_of(env: &Env, seed: u8) -> Bytes {
+        Bytes::from_slice(env, &[seed; 32])
+    }
+
+    fn metadata_registry(env: &Env) -> (RegistryContractClient<'_>, Address) {
+        env.mock_all_auths();
+        let registry =
+            RegistryContractClient::new(env, &env.register_contract(None, RegistryContract));
+        let admin = Address::generate(env);
+        registry.initialize(&admin);
+        (registry, admin)
+    }
+
+    #[test]
+    fn metadata_if_match_creates_then_updates_from_the_hash_last_read() {
+        let env = Env::default();
+        let (registry, admin) = metadata_registry(&env);
+        let name = Symbol::new(&env, "treasury");
+        let v1 = Bytes::from_slice(&env, b"ipfs://QmV1");
+        let v2 = Bytes::from_slice(&env, b"ipfs://QmV2");
+
+        registry.set_metadata_if_match(&admin, &name, &None, &v1, &hash_of(&env, 1), &false, &1);
+        let read = registry.get_metadata_hash(&name);
+        registry.set_metadata_if_match(
+            &admin,
+            &name,
+            &Some(read),
+            &v2,
+            &hash_of(&env, 2),
+            &false,
+            &1,
+        );
+
+        let stored = registry.get_metadata(&name);
+        assert_eq!(stored.uri, v2);
+        assert_eq!(stored.hash, hash_of(&env, 2));
+    }
+
+    #[test]
+    fn metadata_if_match_rejects_the_slower_of_two_concurrent_edits() {
+        let env = Env::default();
+        let (registry, admin) = metadata_registry(&env);
+        let name = Symbol::new(&env, "treasury");
+        let uri = Bytes::from_slice(&env, b"ipfs://QmBase");
+        registry.set_metadata(&admin, &name, &uri, &hash_of(&env, 1), &false, &1);
+
+        // Editors A and B both read hash 1. A writes first.
+        let a = Bytes::from_slice(&env, b"ipfs://QmEditorA");
+        let b = Bytes::from_slice(&env, b"ipfs://QmEditorB");
+        let read = Some(hash_of(&env, 1));
+        registry.set_metadata_if_match(&admin, &name, &read, &a, &hash_of(&env, 2), &false, &1);
+        assert_eq!(
+            registry.try_set_metadata_if_match(
+                &admin,
+                &name,
+                &read,
+                &b,
+                &hash_of(&env, 3),
+                &false,
+                &1
+            ),
+            Err(Ok(Error::StaleData))
+        );
+        assert_eq!(
+            registry.try_set_metadata_if_match(
+                &admin,
+                &name,
+                &None,
+                &b,
+                &hash_of(&env, 3),
+                &false,
+                &1
+            ),
+            Err(Ok(Error::StaleData))
+        );
+        let stored = registry.get_metadata(&name);
+        assert_eq!(stored.uri, a);
+        assert_eq!(stored.hash, hash_of(&env, 2));
+
+        // Expecting an entry that was never written is stale too, and writes nothing.
+        let missing = Symbol::new(&env, "oracle");
+        assert_eq!(
+            registry.try_set_metadata_if_match(
+                &admin,
+                &missing,
+                &read,
+                &b,
+                &hash_of(&env, 3),
+                &false,
+                &1
+            ),
+            Err(Ok(Error::StaleData))
+        );
+        assert_eq!(
+            registry.try_get_metadata(&missing),
+            Err(Ok(Error::MetadataNotFound))
+        );
+    }
+
+    #[test]
+    fn metadata_if_match_retry_of_an_applied_edit_is_a_no_op() {
+        let env = Env::default();
+        let (registry, admin) = metadata_registry(&env);
+        let name = Symbol::new(&env, "treasury");
+        let uri = Bytes::from_slice(&env, b"ipfs://QmV1");
+        env.ledger().set_timestamp(1000);
+        registry.set_metadata_if_match(&admin, &name, &None, &uri, &hash_of(&env, 1), &false, &1);
+
+        // The first response was lost, so the client resends the same edit.
+        env.ledger().set_timestamp(2000);
+        assert!(registry
+            .try_set_metadata_if_match(&admin, &name, &None, &uri, &hash_of(&env, 1), &false, &1)
+            .is_ok());
+        assert_eq!(registry.get_metadata(&name).updated_at, 1000);
+    }
+
+    #[test]
+    fn metadata_if_match_checks_authorization_before_comparing() {
+        let env = Env::default();
+        let (registry, admin) = metadata_registry(&env);
+        let intruder = Address::generate(&env);
+        let name = Symbol::new(&env, "treasury");
+        let uri = Bytes::from_slice(&env, b"ipfs://QmLocked");
+        let other = Bytes::from_slice(&env, b"ipfs://QmOther");
+        registry.set_metadata(&admin, &name, &uri, &hash_of(&env, 1), &true, &1);
+
+        // Right or wrong expected hash, a non-admin only ever sees Unauthorized.
+        for guess in [hash_of(&env, 1), hash_of(&env, 9)] {
+            assert_eq!(
+                registry.try_set_metadata_if_match(
+                    &intruder,
+                    &name,
+                    &Some(guess),
+                    &other,
+                    &hash_of(&env, 2),
+                    &false,
+                    &1
+                ),
+                Err(Ok(Error::Unauthorized))
+            );
+        }
+        // A matching hash does not bypass immutability.
+        assert_eq!(
+            registry.try_set_metadata_if_match(
+                &admin,
+                &name,
+                &Some(hash_of(&env, 1)),
+                &other,
+                &hash_of(&env, 2),
+                &false,
+                &1
+            ),
+            Err(Ok(Error::ImmutableEntry))
+        );
+        assert_eq!(registry.get_metadata(&name).uri, uri);
     }
 }

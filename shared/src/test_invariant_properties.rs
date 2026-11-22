@@ -99,6 +99,16 @@ fn fee_is_monotonic_in_rate_for_a_fixed_amount() {
 }
 
 #[test]
+fn fee_is_monotonic_in_amount_for_a_fixed_rate() {
+    let env = Env::default();
+    let mut rng = Rng(0x5EED_A11CE_0DD_CAFE);
+    for case in 0..CASES {
+        let (r, cap) = (rng.next_i128_in(0, MAX_FEE_BPS), i128::MAX / MAX_FEE_BPS);
+        let lo = rng.next_i128_in(1, cap);
+        assert!(calculate_fee(&env, lo, r).unwrap() <= calculate_fee(&env, rng.next_i128_in(lo, cap), r).unwrap(), "case {case}");
+    }
+}
+#[test]
 fn fee_boundary_rates_take_nothing_or_everything() {
     let env = Env::default();
     let amount = 1_234_567_i128;

@@ -27,9 +27,19 @@
  * Usage:
  *   node scripts/compare-budget.cjs --log <path> [--baseline <path>]
  *     [--threshold <percent>] [--update-baseline] [--output <path>]
+ *     [--worst-case-budget <path>]
  *
- * Exit codes: 0 = every metric within threshold (or baseline updated),
- * 1 = at least one metric regressed beyond threshold, 2 = could not run.
+ * Resource budgets (worst-case load tests):
+ *   --worst-case-budget <path> reads a JSON file of absolute ceilings,
+ *   shaped as { "budgets": { "<key>": { "cpu_instructions": N, "memory_bytes": M } } }.
+ *   Every measured metric that exceeds its absolute ceiling is a FAIL,
+ *   independent of the relative regression threshold. Metrics without a
+ *   budget entry are not checked against an absolute ceiling. Missing or
+ *   malformed budget files cause exit code 2 (could not run), never a silent pass.
+ *
+ * Exit codes: 0 = every metric within threshold and budget (or baseline updated),
+ * 1 = at least one metric regressed beyond threshold or exceeded its budget,
+ * 2 = could not run.
  */
 "use strict";
 
@@ -43,6 +53,7 @@ function parseArgs(argv) {
     threshold: 10,
     updateBaseline: false,
     output: null,
+    worstCaseBudget: null,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -51,6 +62,7 @@ function parseArgs(argv) {
     else if (a === "--threshold") out.threshold = Number(argv[++i]);
     else if (a === "--update-baseline") out.updateBaseline = true;
     else if (a === "--output") out.output = argv[++i];
+    else if (a === "--worst-case-budget") out.worstCaseBudget = argv[++i];
     else {
       console.error(`unknown option: ${a}`);
       process.exit(2);
@@ -82,6 +94,45 @@ function readJson(filePath) {
   return JSON.parse(fs.readFileSync(abs, "utf8"));
 }
 
+/**
+ * Loads and validates the absolute resource-budget file. Returns a map of
+ * key -> { cpu_instructions, memory_bytes } where each field is a finite,
+ * non-negative number. Throws on any structural problem so the caller can
+ * exit 2 rather than silently skipping enforcement.
+ */
+function loadWorstCaseBudgets(filePath) {
+  const abs = path.resolve(filePath);
+  if (!fs.existsSync(abs)) {
+    throw new Error(`worst-case budget file not found: ${filePath}`);
+  }
+  let doc;
+  try {
+    doc = JSON.parse(fs.readFileSync(abs, "utf8"));
+  } catch (e) {
+    throw new Error(`worst-case budget file is not valid JSON: ${e.message}`);
+  }
+  if (!doc || typeof doc !== "object" || typeof doc.budgets !== "object" || doc.budgets === null) {
+    throw new Error(`worst-case budget file must contain a { "budgets": {...} } object`);
+  }
+  const budgets = {};
+  for (const [key, b] of Object.entries(doc.budgets)) {
+    if (!b || typeof b !== "object") {
+      throw new Error(`budget entry "${key}" must be an object`);
+    }
+    for (const field of ["cpu_instructions", "memory_bytes"]) {
+      const v = b[field];
+      if (typeof v !== "number" || !Number.isFinite(v) || v < 0) {
+        throw new Error(`budget entry "${key}".${field} must be a non-negative finite number`);
+      }
+    }
+    budgets[key] = { cpu_instructions: b.cpu_instructions, memory_bytes: b.memory_bytes };
+  }
+  if (Object.keys(budgets).length === 0) {
+    throw new Error("worst-case budget file defines no budget entries (refusing to pass silently)");
+  }
+  return budgets;
+}
+
 /** Percent change of `current` relative to `base`, or null if base is 0. */
 function pctChange(base, current) {
   if (base === 0) return null;
@@ -97,7 +148,7 @@ function fmtPct(p) {
 function main() {
   const args = parseArgs(process.argv.slice(2));
   if (!args.log) {
-    console.error("usage: compare-budget.cjs --log <path> [--baseline <path>] [--threshold <percent>] [--update-baseline]");
+    console.error("usage: compare-budget.cjs --log <path> [--baseline <path>] [--threshold <percent>] [--update-baseline] [--worst-case-budget <path>]");
     process.exit(2);
   }
   if (!fs.existsSync(args.log)) {
@@ -107,6 +158,16 @@ function main() {
   if (!Number.isFinite(args.threshold) || args.threshold < 0) {
     console.error(`✗ invalid --threshold: must be a non-negative number`);
     process.exit(2);
+  }
+
+  let budgets = null;
+  if (args.worstCaseBudget) {
+    try {
+      budgets = loadWorstCaseBudgets(args.worstCaseBudget);
+    } catch (e) {
+      console.error(`✗ ${e.message}`);
+      process.exit(2);
+    }
   }
 
   const current = parseMetrics(fs.readFileSync(args.log, "utf8"));
@@ -144,6 +205,8 @@ function main() {
   const rows = [];
   let anyRegression = false;
   let anyMissing = false;
+  let anyBudgetBreach = false;
+  const breaches = [];
 
   for (const key of keys) {
     const base = baseline[key];
@@ -154,11 +217,31 @@ function main() {
       anyMissing = true;
       continue;
     }
+
+    // Absolute worst-case budget check (independent of the relative baseline).
+    let overBudget = false;
+    let budgetDetail = null;
+    if (budgets && budgets[key]) {
+      const b = budgets[key];
+      const cpuOver = now.cpu_instructions > b.cpu_instructions;
+      const memOver = now.memory_bytes > b.memory_bytes;
+      if (cpuOver || memOver) {
+        overBudget = true;
+        const parts = [];
+        if (cpuOver) parts.push(`cpu ${now.cpu_instructions} > budget ${b.cpu_instructions}`);
+        if (memOver) parts.push(`mem ${now.memory_bytes} > budget ${b.memory_bytes}`);
+        budgetDetail = parts.join("; ");
+        breaches.push({ key, detail: budgetDetail });
+        anyBudgetBreach = true;
+      }
+    }
+
     if (!base) {
       rows.push({
         key,
-        status: "NEW",
-        detail: `cpu=${now.cpu_instructions} mem=${now.memory_bytes} (no baseline yet)`,
+        status: overBudget ? "FAIL" : "NEW",
+        detail: `cpu=${now.cpu_instructions} mem=${now.memory_bytes} (no baseline yet)` +
+          (budgetDetail ? ` — OVER BUDGET: ${budgetDetail}` : ""),
       });
       continue;
     }
@@ -171,13 +254,14 @@ function main() {
 
     rows.push({
       key,
-      status: regressed ? "FAIL" : "PASS",
+      status: regressed || overBudget ? "FAIL" : "PASS",
       baseCpu: base.cpu_instructions,
       nowCpu: now.cpu_instructions,
       cpuPct,
       baseMem: base.memory_bytes,
       nowMem: now.memory_bytes,
       memPct,
+      budgetDetail,
     });
   }
 
@@ -191,10 +275,13 @@ function main() {
       lines.push(`| \`${r.key}\` | - | - | ⚠️ MISSING (${r.detail}) |`);
     } else if (r.status === "NEW") {
       lines.push(`| \`${r.key}\` | - | - | 🆕 NEW (${r.detail}) |`);
+    } else if (r.status === "FAIL" && r.baseCpu === undefined) {
+      lines.push(`| \`${r.key}\` | - | - | ❌ FAIL (${r.detail}) |`);
     } else {
       const icon = r.status === "FAIL" ? "❌ FAIL" : "✓ PASS";
+      const budgetNote = r.budgetDetail ? ` — OVER BUDGET: ${r.budgetDetail}` : "";
       lines.push(
-        `| \`${r.key}\` | ${r.baseCpu} → ${r.nowCpu} (${fmtPct(r.cpuPct)}) | ${r.baseMem} → ${r.nowMem} (${fmtPct(r.memPct)}) | ${icon} |`
+        `| \`${r.key}\` | ${r.baseCpu} → ${r.nowCpu} (${fmtPct(r.cpuPct)}) | ${r.baseMem} → ${r.nowMem} (${fmtPct(r.memPct)}) | ${icon}${budgetNote} |`
       );
     }
   }
@@ -207,6 +294,14 @@ function main() {
     );
   } else {
     lines.push(`✓ No call exceeded the ${args.threshold}% regression threshold.`);
+  }
+  if (budgets) {
+    if (anyBudgetBreach) {
+      lines.push("", "❌ Absolute worst-case resource budget exceeded:");
+      for (const b of breaches) lines.push(`- \`${b.key}\`: ${b.detail}`);
+    } else {
+      lines.push("", "✓ All measured calls are within their absolute worst-case resource budgets.");
+    }
   }
   if (anyMissing) {
     lines.push(
@@ -225,7 +320,7 @@ function main() {
     fs.appendFileSync(summaryPath, report + "\n");
   }
 
-  process.exit(anyRegression ? 1 : 0);
+  process.exit(anyRegression || anyBudgetBreach ? 1 : 0);
 }
 
 main();

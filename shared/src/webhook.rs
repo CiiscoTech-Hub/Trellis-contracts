@@ -280,6 +280,11 @@ mod tests {
         let secret = Bytes::from_slice(&env, b"secret");
         let cfg = WebhookConfig::default();
 
+        let edge = event(&env, 6, 10_000 - cfg.replay_window_seconds, b"{}");
+        assert!(check_timestamp(&env, &cfg, &edge).is_ok());
+        let f_edge = event(&env, 7, 10_000 + cfg.max_future_skew_seconds, b"{}");
+        assert!(check_timestamp(&env, &cfg, &f_edge).is_ok());
+
         let stale = event(&env, 3, 10_000 - cfg.replay_window_seconds - 1, b"{}");
         let stale_sig = sign_webhook(&env, &secret, &stale);
         assert_eq!(

@@ -99,3 +99,26 @@ Purely additive: new storage keys, no changes to `shared::recovery`,
 A deployment script or admin tool adopts this by calling
 `begin_initialization` before running its own per-contract `initialize`
 calls, and `complete_init_step` / `fail_init_step` after each one.
+
+## Verification coverage
+
+The automated tests for this module cover four paths:
+
+- **Normal:** a full sequence of `complete_init_step` calls ends in
+  `Completed`; no rollback is ever entered.
+- **Failure:** `fail_init_step` moves the tracker to `AwaitingRollback`;
+  `verify_rollback` reports `fully_rolled_back: false` while any probe still
+  shows `still_initialized: true` or a probe is missing (fail closed);
+  `complete_rollback` is rejected until a fully rolled-back verification for
+  the same `id` is supplied.
+- **Retry:** after a verified `RolledBack`, `begin_initialization` succeeds
+  with `attempt` incremented; retrying while `InProgress` or
+  `AwaitingRollback` is rejected with `AlreadyInitialized`.
+- **Authorization:** every mutating entry point (`begin_initialization`,
+  `complete_init_step`, `fail_init_step`, `complete_rollback`) rejects
+  non-admin callers with `Unauthorized` before touching the tracker;
+  `verify_rollback` and `get_tracker` remain callable without auth.
+
+Operators should run these tests in CI before relying on the rollback gate
+for a production deployment. Migrating an existing deployment script onto
+this module requires no storage migration, since all keys are new.

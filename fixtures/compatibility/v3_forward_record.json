@@ -1,0 +1,18 @@
+{
+  "schema_version": 3,
+  "description": "Forward-compatible V3 aid record featuring cryptographic metadata digest for compliance auditing",
+  "records": [
+    {
+      "id": 1001,
+      "donor": "GBZXN7PIRZGNMHGA728RGRFZAPPWN9G8VDGSQZ85W7K8VN9PIRZGNMHG",
+      "recipient": "GA728RGRFZAPPWN9G8VDGSQZ85W7K8VN9PIRZGNMHGBZXN7PIRZGNMHG",
+      "token": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+      "amount": "5000000000",
+      "expiry_ledger": 125000,
+      "status": "Pending",
+      "schema_version": 3,
+      "metadata_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ]
+}
+
