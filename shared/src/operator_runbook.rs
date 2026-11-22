@@ -2,6 +2,10 @@
 //!
 //! Provides automated checks and verification steps for operators during
 //! incident response and recovery procedures.
+//!
+//! These are the record types; `ops_checks::incident_runbook` executes them
+//! against a local aid-contract deployment (Issue #452). See
+//! `docs/INCIDENT_RUNBOOK.md`.
 
 use soroban_sdk::{contracterror, contracttype, Env, String, Vec};
 
@@ -120,23 +124,19 @@ pub fn update_check_status(
 }
 
 /// Evaluate overall runbook result.
+///
+/// `all_passed` is true only when every mandatory check is `Passed`. A
+/// mandatory check that is still `InProgress` or was `Skipped` has not
+/// verified anything, so it fails the runbook the same way a `Failed` check
+/// does (Issue #452). Optional checks never affect the result.
 pub fn evaluate_runbook(
     env: &Env,
     incident_id: &str,
     checks: &Vec<RunbookCheck>,
 ) -> RunbookResult {
-    let mut all_passed = true;
-
-    // Check if any mandatory check failed
-    let mut i = 0;
-    while i < checks.len() {
-        let check = checks.get(i).unwrap();
-        if check.is_mandatory && check.status == CheckStatus::Failed {
-            all_passed = false;
-            break;
-        }
-        i += 1;
-    }
+    let all_passed = checks
+        .iter()
+        .all(|check| !check.is_mandatory || check.status == CheckStatus::Passed);
 
     RunbookResult {
         incident_id: String::from_str(env, incident_id),
@@ -273,5 +273,34 @@ mod tests {
 
         let result = evaluate_runbook(&env, "incident-1", &checks);
         assert!(!result.all_passed); // Mandatory check failed
+    }
+
+    #[test]
+    fn unverified_mandatory_checks_fail_the_runbook() {
+        let env = Env::default();
+        for status in [CheckStatus::InProgress, CheckStatus::Skipped] {
+            let mut checks = Vec::new(&env);
+            let mut done = create_check(&env, "done", "Test", IncidentSeverity::High, "Fix", true);
+            done.status = CheckStatus::Passed;
+            checks.push_back(done);
+            let mut open = create_check(&env, "open", "Test", IncidentSeverity::High, "Fix", true);
+            open.status = status;
+            checks.push_back(open);
+            assert!(!evaluate_runbook(&env, "incident-2", &checks).all_passed, "{status:?}");
+        }
+    }
+
+    #[test]
+    fn optional_checks_do_not_block_the_runbook() {
+        let env = Env::default();
+        let mut checks = Vec::new(&env);
+        let mut required = create_check(&env, "req", "Test", IncidentSeverity::High, "Fix", true);
+        required.status = CheckStatus::Passed;
+        checks.push_back(required);
+        let mut optional = create_check(&env, "opt", "Test", IncidentSeverity::Low, "Fix", false);
+        optional.status = CheckStatus::Failed;
+        checks.push_back(optional);
+        checks.push_back(create_check(&env, "opt2", "Test", IncidentSeverity::Low, "Fix", false));
+        assert!(evaluate_runbook(&env, "incident-3", &checks).all_passed);
     }
 }

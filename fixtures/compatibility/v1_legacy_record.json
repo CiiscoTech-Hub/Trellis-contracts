@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "description": "Legacy V1 aid record prior to explicit token binding and schema tagging",
+  "records": [
+    {
+      "id": 1001,
+      "donor": "GBZXN7PIRZGNMHGA728RGRFZAPPWN9G8VDGSQZ85W7K8VN9PIRZGNMHG",
+      "recipient": "GA728RGRFZAPPWN9G8VDGSQZ85W7K8VN9PIRZGNMHGBZXN7PIRZGNMHG",
+      "amount": "5000000000",
+      "expiry_ledger": 125000,
+      "status": "Pending"
+    },
+    {
+      "id": 1002,
+      "donor": "GBZXN7PIRZGNMHGA728RGRFZAPPWN9G8VDGSQZ85W7K8VN9PIRZGNMHG",
+      "recipient": "GC4K666M354VBH5S54R3P5TCHMVN5Y2F5Q2Z6T2X5F8H5J2L4M6N8P1Q",
+      "amount": "2500000000",
+      "expiry_ledger": 130000,
+      "status": "Settled"
+    }
+  ]
+}
+

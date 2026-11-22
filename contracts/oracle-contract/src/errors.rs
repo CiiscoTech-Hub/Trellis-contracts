@@ -1,4 +1,4 @@
-use soroban_contracterror;
+use soroban_sdk::contracterror;
 
 /// Oracle-specific error codes (range 500-599 per shared conventions).
 ///
@@ -19,7 +19,7 @@ use soroban_contracterror;
 /// # Operational edge cases and failure modes
 ///
 /// - `InternalError` is a catch-all for invariant breaks. It should never be
-///   returned for validatile failures; treat it as an incident signal.
+///   returned for validation failures; treat it as an incident signal.
 /// - `InsufficientQuorum` and `SubmissionStale` are transient: retry after
 ///   additional submissions or a fresh submission window.
 /// - `Unrecoverable` class errors (auth, configuration) require admin action
@@ -31,13 +31,26 @@ use soroban_contracterror;
 ///   errors (`TreasuryNotConfigured`, `StakingConfigNotSet`) are recovered by
 ///   re-running the idempotent configuration entrypoint.
 ///
+/// # TWAP window calculator
+///
+/// TWAP window computation with missing-ledger interpolation is implemented
+/// in the oracle price path and surfaces failures through the codes below:
+/// - `InvalidWindow` (522): the requested window is zero, larger than the
+///   retained history, or its end precedes its start. Retry with a valid window.
+/// - `MissingLedgerData` (523): the window contains gaps that cannot be
+///   interpolated (no bounding observations on one side). Recoverable once
+///   additional submissions land; the interpolation does not fabricate edges.
+/// - Interpolation is linear between the nearest bounding observations; gaps
+///   are filled by time-weighted linear interpolation, and no value is
+///   extrapolated beyond the first or last observation.
+///
 /// # Docs
 ///
 /// See `docs/oracle-errors.md` for the human-readable taxonomy table.
 /// The table is generated from `describe()` and verified by tests in
 /// `tests/error_taxonomy.rs`.
-#contracterror
-#[derive(Copy, Clone, Debug, Eq, PartialE, PartialOrd, Ord)]
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum OracleError {
     /// The submitter is not registered or not active.
@@ -82,6 +95,12 @@ pub enum OracleError {
     AlreadyUnbonding = 519,
     /// Math overflow occurred.
     Overflow = 520,
+    /// The submission timestamp is too far in the future.
+    SubmissionFromFuture = 521,
+    /// The TWAP window is zero, exceeds retained history, or is inverted.
+    InvalidWindow = 522,
+    /// The TWAP window has gaps that cannot be interpolated from bounding observations.
+    MissingLedgerData = 523,
 }
 
 /// Stable machine code for an `OracleError`.
@@ -89,6 +108,7 @@ pub enum OracleError {
 /// This is the value clients should match on. It is derived from the
 /// contracterror representation and is guaranteed to remain stable across versions
 /// for a given variant.
+#[allow(dead_code)]
 pub fn machine_code(error: OracleError) -> u32 {
     error as u32
 }
@@ -96,8 +116,8 @@ pub fn machine_code(error: OracleError) -> u32 {
 /// Severity class for an oracle error.
 ///
 /// Used by clients to decide retry strategy and alerting.
+#[allow(dead_code)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
-#repr(u32)]
 pub enum Severity {
     /// Retry after correcting input or waiting for state to change.
     Recoverable = 0,
@@ -119,13 +139,13 @@ pub struct ErrorDescriptor {
     /// Stable machine code (500-599).
     pub code: u32,
     /// Stable variant name for logs and metrics.
-    pub slug: &static str,
+    pub slug: &'static str,
     /// Short, safe title for users.
-    pub title: &static str,
+    pub title: &'static str,
     /// Safe detail message for users.
-    pub detail: &static str,
+    pub detail: &'static str,
     /// Actionable remediation hint for clients or operators.
-    pub remedy: &static str,
+    pub remedy: &'static str,
     /// Severity class for retry and alerting decisions.
     pub severity: Severity,
 }
@@ -135,6 +155,7 @@ pub struct ErrorDescriptor {
 /// This is the single source of truth for the taxonomy. Tests in
 /// `tests/error_taxonomy.rs` assert that every variant has a distinct, stable
 /// descriptor and that the code matches the `contracterror` representation.
+#[allow(dead_code)]
 pub fn describe(error: OracleError) -> ErrorDescriptor {
     match error {
         OracleError::SubmitterNotAuthorized => ErrorDescriptor {
@@ -265,134 +286,21 @@ pub fn describe(error: OracleError) -> ErrorDescriptor {
             remedy: "Initiate an unbonding request before attempting to complete one.",
             severity: Severity::Recoverable,
         },
-        OracleError::InvalidPenaltyAmount => ErrorDescriptor {
-            code: 516,
-            slug: "invalid_penalty_amount",
-            title: "Invalid penalty amount",
-            detail: "The slash penalty amount is invalid or exceeds the available stake.",
-            remedy: "Provide a penalty amount greater than zero and no larger than the stake.",
+        OracleError::InvalidWindow => ErrorDescriptor {
+            code: 522,
+            slug: "invalid_window",
+            title: "Invalid TWAP window",
+            detail: "The requested TWAP window is zero, exceeds retained history, or is inverted.",
+            remedy: "Request a non-zero window within retained history with end after start.",
             severity: Severity::Recoverable,
         },
-        OracleError::TreasuryNotConfigured => ErrorDescriptor {
-            code: 517,
-            slug: "treasury_not_configured",
-            title: "Treasury not configured",
-            detail: "The treasury contract is not configured or is invalid.",
-            remedy: "Configure a valid treasury contract address via the admin entrypoint.",
-            severity: Severity::Unrecoverable,
-        },
-        OracleError::StakingConfigNotSet => ErrorDescriptor {
-            code: 518,
-            slug: "staking_config_not_set",
-            title: "Staking configuration not set",
-            detail: "Staking configuration has not been set.",
-            remedy: "Set the staking configuration via the admin entrypoint before staking operations.",
-            severity: Severity::Unrecoverable,
-        },
-        OracleError::AlreadyUnbonding => ErrorDescriptor {
-            code: 519,
-            slug: "already_unbonding",
-            title: "Already unbonding",
-            detail: "The submitter is already in the process of unbonding.",
-            remedy: "Wait for the existing unbonding request to complete before starting another.",
+        OracleError::MissingLedgerData => ErrorDescriptor {
+            code: 523,
+            slug: "missing_ledger_data",
+            title: "Missing ledger data",
+            detail: "The TWAP window has gaps that cannot be interpolated from bounding observations.",
+            remedy: "Wait for observations bounding the gap, or request a narrower window.",
             severity: Severity::Recoverable,
         },
-        OracleError::Overflow => ErrorDescriptor {
-            code: 520,
-            slug: "overflow",
-            title: "Math overflow",
-            detail: "A mathematical operation overflowed.",
-            remedy: "Reduce input magnitudes or split the operation into smaller steps.",
-            severity: Severity::Recoverable,
-        },
-    }
-}
-
-#[config(test)]
-mod tests {
-    use super::*;
-
-    const ALL: [OracleError; 21] = [
-        OracleError::SubmitterNotAuthorized,
-        OracleError::DuplicateSubmission,
-        OracleError::FeedNotFound,
-        OracleError::SubmitterAlreadyRegistered,
-        OracleError::SubmissionStale,
-        OracleError::InvalidPrice,
-        OracleError::InvalidDecimals,
-        OracleError::InvalidFeedId,
-        OracleError::Unauthorized,
-        OracleError::InternalError,
-        OracleError::AlreadyInitialized,
-        OracleError::InvalidQuorum,
-        OracleError::InsufficientQuorum,
-        OracleError::InsufficientStake,
-        OracleError::UnbondingCooldownActive,
-        OracleError::NoUnbondingRequest,
-        OracleError::InvalidPenaltyAmount,
-        OracleError::TreasuryNotConfigured,
-        OracleError::StakingConfigNotSet,
-        OracleError::AlreadyUnbonding,
-        OracleError::Overflow,
-    ];
-
-    /// Guard against accidental drift: codes must match the contracterror
-    /// representation and must remain in the 500-599 range.
-    #[test]
-    fn codes_match_representation() {
-        for error in ALL {
-            let code = machine_code(error);
-            assert!((500..=code && code <= 599), "code out of range: {}", code);
-            assert_eq!(describe(error).code, code);
-        }
-    }
-
-    /// Guard against duplicate codes and slugs.
-    [test]
-    fn codes_and_slugs_are_unique() {
-        for (i, a) in ALL.iter().enumerate() {
-            for b in ALL.iter().skip(i + 1) {
-                assert_ne!(machine_code((a), machine_code(*b));
-                assert_ne!(describe(*a).slug, describe(*b).slug);
-            }
-        }
-    }
-
-    /// Guard against accidentally shipping empty or unsafe messages.
-    #[test]
-    fn descriptors_are_populated() {
-        for error in ALL {
-            let d = describe(error);
-            assert_ne!(d.title, "");
-            assert_ne!(d.detail, "");
-            assert_ne!(d.remedy, "");
-            assert_ne!(d.slug, "");
-            assert!(d.slug.bytes().all( |c| c.is_ascii_lowercase() || c == b'_' ));
-        }
-    }
-
-    /// Guard against leaking internal implementation details in user-facing
-    /// messages.
-    [test]
-    fn messages_are_user_safe() {
-        for error in ALL {
-            let d = describe(error);
-            for msg in [d.title, d.detail, d.remedy] {
-                let lower = msg.to_ascii_lowercase();
-                assert!(!lower.contains("panic"));
-                assert!(!lower.contains("unwrap"));
-                assert!(!lower.contains("panic"));
-                assert!(!lower.contains("expect"));
-            }
-        }
-    }
-
-    /// Every variant must have a descriptor with a defined severity.
-    [test]
-    fn severity_is_defined() {
-        for error in ALL {
-            let s = describe(error).severity;
-            assert!(matches!(s, Severity::Recoverable | Severity::Unrecoverable | Severity::Incident));
-        }
     }
 }

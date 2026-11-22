@@ -164,6 +164,15 @@ pub fn propose_ownership_transfer(
         if now <= existing.expiry {
             return Err(Error::TransferAlreadyPending);
         }
+        // The stale proposal is about to be overwritten; keep a record of it.
+        crate::ownership_history::record_ownership_action(
+            env,
+            crate::ownership_history::OwnershipAction::Expired,
+            current_owner,
+            &existing.current_owner,
+            &existing.target_owner,
+            existing.expiry,
+        );
     }
 
     let transfer = PendingOwnershipTransfer {
@@ -191,6 +200,15 @@ pub fn propose_ownership_transfer(
         after_hash,
     );
 
+    crate::ownership_history::record_ownership_action(
+        env,
+        crate::ownership_history::OwnershipAction::Proposed,
+        current_owner,
+        current_owner,
+        target_owner,
+        expiry,
+    );
+
     env.events().publish(
         (symbol_short!("auth"), symbol_short!("own_prop")),
         (current_owner.clone(), target_owner.clone(), expiry),
@@ -215,7 +233,17 @@ pub fn accept_ownership_transfer(env: &Env, caller: &Address) -> Result<(), Erro
 
     let now = env.ledger().timestamp();
     if now > transfer.expiry {
+        // Inside a contract invocation this error rolls back both writes; use
+        // `ownership_history::expire_ownership_transfer` for durable cleanup.
         env.storage().instance().remove(&KEY_PENDING_OWNER);
+        crate::ownership_history::record_ownership_action(
+            env,
+            crate::ownership_history::OwnershipAction::Expired,
+            caller,
+            &transfer.current_owner,
+            &transfer.target_owner,
+            transfer.expiry,
+        );
         return Err(Error::TransferExpired);
     }
 
@@ -248,6 +276,15 @@ pub fn accept_ownership_transfer(env: &Env, caller: &Address) -> Result<(), Erro
         Symbol::new(env, "acpt_own"),
         before_hash,
         after_hash,
+    );
+
+    crate::ownership_history::record_ownership_action(
+        env,
+        crate::ownership_history::OwnershipAction::Accepted,
+        caller,
+        &transfer.current_owner,
+        &transfer.target_owner,
+        transfer.expiry,
     );
 
     env.events().publish(
@@ -286,12 +323,123 @@ pub fn cancel_ownership_transfer(env: &Env, caller: &Address) -> Result<(), Erro
         after_hash,
     );
 
+    crate::ownership_history::record_ownership_action(
+        env,
+        crate::ownership_history::OwnershipAction::Cancelled,
+        caller,
+        &transfer.current_owner,
+        &transfer.target_owner,
+        transfer.expiry,
+    );
+
     env.events().publish(
         (symbol_short!("auth"), symbol_short!("own_canc")),
         (caller.clone(), transfer.target_owner),
     );
 
     Ok(())
+}
+
+/// Rejects an active pending ownership transfer. Caller must be the designated
+/// `target_owner`.
+///
+/// Returns `Err(Error::NoPendingTransfer)` if no transfer is pending.
+/// Returns `Err(Error::NotPendingOwner)` if `caller != target_owner`.
+/// Returns `Err(Error::TransferExpired)` if the transfer has already expired
+/// (clearing the stale pending record).
+pub fn reject_ownership_transfer(env: &Env, caller: &Address) -> Result<(), Error> {
+    caller.require_auth();
+
+    let transfer = get_pending_ownership_transfer(env).ok_or(Error::NoPendingTransfer)?;
+
+    if *caller != transfer.target_owner {
+        return Err(Error::NotPendingOwner);
+    }
+
+    let now = env.ledger().timestamp();
+    if now > transfer.expiry {
+        env.storage().instance().remove(&KEY_PENDING_OWNER);
+        return Err(Error::TransferExpired);
+    }
+
+    env.storage().instance().remove(&KEY_PENDING_OWNER);
+
+    let before_hash = env
+        .crypto()
+        .sha256(&soroban_sdk::Bytes::from_slice(env, &[1]))
+        .into();
+    let after_hash = env
+        .crypto()
+        .sha256(&soroban_sdk::Bytes::from_slice(env, &[0]))
+        .into();
+    crate::history::record_mutation(
+        env,
+        symbol_short!("admin"),
+        caller.clone(),
+        Symbol::new(env, "rej_own"),
+        before_hash,
+        after_hash,
+    );
+
+    env.events().publish(
+        (symbol_short!("auth"), symbol_short!("own_rej")),
+        (transfer.current_owner, caller.clone()),
+    );
+
+    Ok(())
+}
+
+/// Permissionlessly clears an expired pending ownership transfer so a new
+/// transfer can be proposed cleanly.
+///
+/// Returns `Err(Error::NoPendingTransfer)` if no transfer is pending.
+/// Returns `Err(Error::InvalidArgument)` if the pending transfer has not yet expired.
+pub fn expire_ownership_transfer(env: &Env) -> Result<(), Error> {
+    let transfer = get_pending_ownership_transfer(env).ok_or(Error::NoPendingTransfer)?;
+    let now = env.ledger().timestamp();
+    if now <= transfer.expiry {
+        return Err(Error::InvalidArgument);
+    }
+
+    env.storage().instance().remove(&KEY_PENDING_OWNER);
+
+    let before_hash = env
+        .crypto()
+        .sha256(&soroban_sdk::Bytes::from_slice(env, &[1]))
+        .into();
+    let after_hash = env
+        .crypto()
+        .sha256(&soroban_sdk::Bytes::from_slice(env, &[0]))
+        .into();
+    crate::history::record_mutation(
+        env,
+        symbol_short!("admin"),
+        transfer.current_owner.clone(),
+        Symbol::new(env, "exp_own"),
+        before_hash,
+        after_hash,
+    );
+
+    env.events().publish(
+        (symbol_short!("auth"), symbol_short!("own_exp")),
+        (transfer.current_owner, transfer.target_owner, transfer.expiry),
+    );
+
+    Ok(())
+}
+
+/// Returns `Some(true)` if a pending ownership transfer exists and is expired,
+/// `Some(false)` if it is still within its acceptance window, or `None` if no
+/// transfer is pending.
+pub fn is_ownership_transfer_expired(env: &Env) -> Option<bool> {
+    get_pending_ownership_transfer(env).map(|t| env.ledger().timestamp() > t.expiry)
+}
+
+/// Returns the remaining seconds before the pending ownership transfer expires,
+/// or `None` if no transfer is pending.
+pub fn ownership_transfer_time_remaining(env: &Env) -> Option<u64> {
+    get_pending_ownership_transfer(env)
+        .map(|t| t.expiry.saturating_sub(env.ledger().timestamp()))
 }
 
 // ---------------------------------------------------------------------------
@@ -468,4 +616,116 @@ pub fn require_not_paused(env: &Env) -> Result<(), Error> {
         return Err(Error::ContractPaused);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::{
+        contract, contractimpl,
+        testutils::{Address as _, Ledger as _},
+        Env,
+    };
+
+    #[contract]
+    struct AuthOwnershipTestContract;
+
+    #[contractimpl]
+    impl AuthOwnershipTestContract {}
+
+    fn setup_env() -> (Env, Address, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, AuthOwnershipTestContract);
+        let admin = Address::generate(&env);
+        env.as_contract(&contract_id, || {
+            initialize_admin(&env, &admin).unwrap();
+        });
+        (env, contract_id, admin)
+    }
+
+    #[test]
+    fn test_reject_and_retry_ownership_transfer() {
+        let (env, contract_id, owner) = setup_env();
+        let target1 = Address::generate(&env);
+        let target2 = Address::generate(&env);
+        env.ledger().set_timestamp(100);
+
+        env.as_contract(&contract_id, || {
+            propose_ownership_transfer(&env, &owner, &target1, 200).unwrap();
+            assert_eq!(is_ownership_transfer_expired(&env), Some(false));
+            assert_eq!(ownership_transfer_time_remaining(&env), Some(100));
+
+            // Designated target rejects
+            reject_ownership_transfer(&env, &target1).unwrap();
+            assert_eq!(get_pending_ownership_transfer(&env), None);
+            assert_eq!(get_admin(&env), owner);
+
+            // Owner retries with a new target and succeeds
+            propose_ownership_transfer(&env, &owner, &target2, 250).unwrap();
+            accept_ownership_transfer(&env, &target2).unwrap();
+            assert_eq!(get_admin(&env), target2);
+            assert!(has_role(&env, &target2, Role::Admin));
+            assert!(!has_role(&env, &owner, Role::Admin));
+        });
+    }
+
+    #[test]
+    fn test_expire_ownership_transfer_and_repropose() {
+        let (env, contract_id, owner) = setup_env();
+        let target = Address::generate(&env);
+        env.ledger().set_timestamp(100);
+
+        env.as_contract(&contract_id, || {
+            propose_ownership_transfer(&env, &owner, &target, 150).unwrap();
+            // Cannot expire before deadline
+            assert_eq!(expire_ownership_transfer(&env), Err(Error::InvalidArgument));
+        });
+
+        env.ledger().set_timestamp(151);
+        env.as_contract(&contract_id, || {
+            assert_eq!(is_ownership_transfer_expired(&env), Some(true));
+            assert_eq!(ownership_transfer_time_remaining(&env), Some(0));
+
+            // Permissionless expiry cleanup
+            expire_ownership_transfer(&env).unwrap();
+            assert_eq!(get_pending_ownership_transfer(&env), None);
+            assert_eq!(expire_ownership_transfer(&env), Err(Error::NoPendingTransfer));
+
+            // Retry proposal after expiry
+            propose_ownership_transfer(&env, &owner, &target, 300).unwrap();
+            accept_ownership_transfer(&env, &target).unwrap();
+            assert_eq!(get_admin(&env), target);
+        });
+    }
+
+    #[test]
+    fn test_reject_authorization_and_expiry_failures() {
+        let (env, contract_id, owner) = setup_env();
+        let target = Address::generate(&env);
+        let stranger = Address::generate(&env);
+        env.ledger().set_timestamp(100);
+
+        env.as_contract(&contract_id, || {
+            assert_eq!(
+                reject_ownership_transfer(&env, &target),
+                Err(Error::NoPendingTransfer)
+            );
+            propose_ownership_transfer(&env, &owner, &target, 200).unwrap();
+            assert_eq!(
+                reject_ownership_transfer(&env, &stranger),
+                Err(Error::NotPendingOwner)
+            );
+            assert!(get_pending_ownership_transfer(&env).is_some());
+        });
+
+        env.ledger().set_timestamp(201);
+        env.as_contract(&contract_id, || {
+            assert_eq!(
+                reject_ownership_transfer(&env, &target),
+                Err(Error::TransferExpired)
+            );
+            assert_eq!(get_pending_ownership_transfer(&env), None);
+        });
+    }
 }

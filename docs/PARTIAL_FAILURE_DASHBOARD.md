@@ -491,6 +491,44 @@ If external references aren't appearing in the redacted view:
 2. Verify the system name is a valid Symbol
 3. Check that the reference ID is not empty
 
+## Operator registry
+
+`generate_enhanced_dashboard` works on a `Vec<PartialFailure>` the caller
+already holds. `shared::failure_registry` (Issue #443) is the persistent store
+behind the dashboard, with an operator workflow for clearing failures.
+
+| Function | Who | Effect |
+|---|---|---|
+| `record_partial_failure` | Contract code that saw the failure | Stores the failure (`Retryable` or `Unresolved`, by error code) and returns its id. A repeat report for the same open `(OperationType, operation_id)` returns the same id |
+| `record_retry_outcome(id, succeeded)` | Retry path | Increments `retry_attempts`; on success, closes the failure as `Resolved` with note `retry_ok` |
+| `resolve_failure(admin, id, note)` | Admin | Closes the failure as `Resolved` and writes a `FailureResolution` |
+| `ignore_failure(admin, id, note)` | Admin | Closes the failure as `Ignored` and writes a `FailureResolution` |
+| `reopen_failure(admin, id)` | Admin | Rolls back a mistaken close: the failure returns to the open set and its resolution is removed |
+| `unresolved_failures(cursor, limit)` | Anyone | Redacted page of open failures, oldest first, with ages recomputed |
+| `unresolved_summary()` | Anyone | Open, critical and retryable counts, the oldest failure, and groupings |
+
+Edge cases:
+
+- **Bounded reads.** Only open failures are indexed, and at most
+  `MAX_OPEN_FAILURES` (200) can be open at once. Recording more returns
+  `Error::QuotaExceeded`, so the dashboard read never grows with history, and
+  closing failures frees room. Pages are capped at `MAX_FAILURE_PAGE` (50).
+- **Stale ages.** `age_ledgers` is recomputed on every read, so the age
+  groupings reflect the current ledger rather than the ledger the failure was
+  recorded on. `severity` is fixed at record time.
+- **Closing twice.** Resolving or ignoring a failure that is not open returns
+  `Error::InvalidArgument`. Unknown ids return `Error::NotFound`.
+- **Retrying a terminal failure.** `record_retry_outcome` on a failure that is
+  not `Retryable` returns `Error::InvalidArgument`.
+- **Reopen conflicts.** Reopening returns `InvalidArgument` when a newer open
+  report already exists for the same operation, and `QuotaExceeded` when the
+  open set is full.
+- **Redaction.** Reads return only `RedactedPartialFailure`. External reference
+  ids are never exposed, only the external system names.
+
+The registry uses the existing `dashboard.rs` types and functions unchanged, so
+no migration is needed.
+
 ## Future Enhancements
 
 Potential future improvements:

@@ -49,6 +49,7 @@ use soroban_sdk::{
 
 pub mod api;
 pub mod correlation;
+pub mod export;
 pub mod storage;
 mod transitions;
 pub mod types;
@@ -111,6 +112,21 @@ pub enum AidError {
 
 #[contract]
 pub struct AidContract;
+
+/// Verify `admin` is the configured contract admin and holds a valid signature,
+/// returning the shared [`Error`] type used by the regional-control surface.
+///
+/// Mirrors the inline check in [`AidContract::update_config`] so the regional
+/// disbursement admin surface (Issue #539) enforces authorization identically.
+/// Named distinctly from the `AidError`-returning `require_admin` used by the
+/// rest of the contract.
+fn ensure_admin(env: &Env, admin: &Address) -> Result<(), Error> {
+    if *admin != shared::auth::get_admin(env) {
+        return Err(Error::Unauthorized);
+    }
+    admin.require_auth();
+    Ok(())
+}
 
 #[contractimpl]
 impl AidContract {
@@ -226,6 +242,78 @@ impl AidContract {
     }
 
     // -----------------------------------------------------------------------
+    // Regional disbursement controls (Issue #539)
+    // -----------------------------------------------------------------------
+
+    /// Configure (or replace) the regional disbursement limit for `region`.
+    ///
+    /// Admin only. See [`shared::regional_velocity::RegionLimit`] for the
+    /// volume-quota and velocity-breaker parameters.
+    pub fn configure_region(
+        env: Env,
+        admin: Address,
+        region: Symbol,
+        limit: shared::regional_velocity::RegionLimit,
+    ) -> Result<(), Error> {
+        ensure_admin(&env, &admin)?;
+        shared::regional_velocity::set_region_limit(&env, &region, &limit)
+    }
+
+    /// Map a recipient to a region (admin only). Regional controls apply to a
+    /// recipient only once mapped; unmapped recipients are unconstrained.
+    pub fn set_recipient_region(
+        env: Env,
+        admin: Address,
+        recipient: Address,
+        region: Symbol,
+    ) -> Result<(), Error> {
+        ensure_admin(&env, &admin)?;
+        storage::set_recipient_region(&env, &recipient, &region);
+        Ok(())
+    }
+
+    /// Remove a recipient's region mapping, returning them to fail-open. Admin only.
+    pub fn clear_recipient_region(
+        env: Env,
+        admin: Address,
+        recipient: Address,
+    ) -> Result<(), Error> {
+        ensure_admin(&env, &admin)?;
+        storage::clear_recipient_region(&env, &recipient);
+        Ok(())
+    }
+
+    /// The region a recipient is mapped to, if any.
+    pub fn recipient_region(env: Env, recipient: Address) -> Option<Symbol> {
+        storage::get_recipient_region(&env, &recipient)
+    }
+
+    /// Snapshot a region's disbursement quota and breaker state.
+    pub fn region_status(env: Env, region: Symbol) -> shared::regional_velocity::RegionStatus {
+        shared::regional_velocity::region_status(&env, &region)
+    }
+
+    /// Clear a latched regional breaker and restart its velocity window. Admin only.
+    pub fn reset_region_breaker(
+        env: Env,
+        admin: Address,
+        region: Symbol,
+    ) -> Result<(), Error> {
+        ensure_admin(&env, &admin)?;
+        shared::regional_velocity::reset_breaker(&env, &region)
+    }
+
+    /// Manually latch a regional breaker (operator emergency stop). Admin only.
+    pub fn trip_region_breaker(
+        env: Env,
+        admin: Address,
+        region: Symbol,
+    ) -> Result<(), Error> {
+        ensure_admin(&env, &admin)?;
+        shared::regional_velocity::trip_breaker(&env, &region)
+    }
+
+    // -----------------------------------------------------------------------
     // Aid creation
     // -----------------------------------------------------------------------
 
@@ -256,7 +344,10 @@ impl AidContract {
         }
 
         // Validate/normalize the optional correlation ID before any state change.
-        let correlation_id = correlation::normalize(&env, correlation_id);
+        let correlation_id = match correlation::normalize(&env, correlation_id) {
+            Ok(id) => id,
+            Err(e) => panic_with_error!(&env, e),
+        };
 
         // Quota enforcement (Issue #65): fail-open when unconfigured so
         // existing deployments keep working until maintainers set limits.
@@ -269,6 +360,17 @@ impl AidContract {
             }
             // Fail-open for unset quota config is handled inside
             // check_and_consume; any other error is non-fatal here.
+        }
+
+        // Regional disbursement controls (Issue #539): per-region rolling
+        // volume quota + velocity circuit breaker, enforced at the point of
+        // commitment. Fail-open when the recipient is not mapped to a region so
+        // existing deployments keep working until an operator opts in. An
+        // over-quota region or a tripped breaker aborts with a user-safe error.
+        if let Some(region) = storage::get_recipient_region(&env, &recipient) {
+            if let Err(e) = shared::regional_velocity::guard_disbursement(&env, &region, amount) {
+                panic_with_error!(&env, e);
+            }
         }
 
         // Auto-allocate aid ID via counter (avoids caller-supplied collision)
@@ -1172,6 +1274,7 @@ impl AidContract {
 
     /// Returns a paginated list of aid records created by `donor`.
     pub fn list_aids_by_donor(env: Env, donor: Address, cursor: u32, limit: u32) -> AidPage {
+        donor.require_auth();
         let ids = storage::get_donor_aids(&env, &donor);
         paginate(&env, &ids, cursor, limit)
     }
@@ -1183,6 +1286,7 @@ impl AidContract {
         cursor: u32,
         limit: u32,
     ) -> AidPage {
+        recipient.require_auth();
         let ids = storage::get_recipient_aids(&env, &recipient);
         paginate(&env, &ids, cursor, limit)
     }
@@ -1229,6 +1333,7 @@ impl AidContract {
         start_after_id: Option<u64>,
         limit: u32,
     ) -> AidPageResponse {
+        donor.require_auth();
         let ids = storage::get_donor_aids(&env, &donor);
         let req = shared::PageRequest::ascending(start_after_id, limit);
         let res = shared::paginate_id_list(&env, &ids, &req, shared::DEFAULT_MAX_SCAN, |id| {
@@ -1256,6 +1361,7 @@ impl AidContract {
         start_after_id: Option<u64>,
         limit: u32,
     ) -> AidPageResponse {
+        recipient.require_auth();
         let ids = storage::get_recipient_aids(&env, &recipient);
         let req = shared::PageRequest::ascending(start_after_id, limit);
         let res = shared::paginate_id_list(&env, &ids, &req, shared::DEFAULT_MAX_SCAN, |id| {
@@ -1415,3 +1521,7 @@ mod tests;
 /// `tests` so it can be run in isolation via `scripts/profile-budget.sh`.
 #[cfg(test)]
 mod profile_budget;
+
+
+#[cfg(test)]
+mod aid_export_test;

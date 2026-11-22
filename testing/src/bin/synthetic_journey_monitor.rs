@@ -1,92 +1,78 @@
-//! Runnable synthetic monitor for the fund -> quote -> settle happy path.
+//! Runnable synthetic monitor for the fund -> quote -> settle journey.
 //!
 //! This uses the repository's credential-free, in-process sandbox adapters. It
-//! never contacts Soroban RPC or submits a transaction to a network.
+//! never contacts Soroban RPC or submits a transaction to a network. The
+//! journey itself (failure attribution, bounded settlement retry, credential
+//! refusal) lives in `testing::synthetic_monitor` so it is unit tested.
+//!
+//! Exit codes: 0 pass, 1 fail (the JSON `retryable` field says whether a rerun can help).
 
 use std::time::Instant;
 
-use soroban_sdk::{testutils::Address as _, Address, Env, Symbol};
-use testing::sandbox::{Sandbox, SandboxConfig};
-
-const AMOUNT: i128 = 100_000;
-const ORACLE_PRICE: i128 = 1_000_000;
-const EXPECTED_FEE: i128 = 500;
+use soroban_sdk::Env;
+use testing::synthetic_monitor::{
+    run_journey, JourneyFault, JourneyOptions, DEFAULT_MAX_SETTLEMENT_ATTEMPTS, JOURNEY_NAME,
+};
 
 fn main() {
     let started = Instant::now();
     let env = Env::default();
-    let payer = Address::generate(&env);
-    let payee = Address::generate(&env);
-    let asset = Symbol::new(&env, "synthetic_asset");
-    let mut sandbox = match Sandbox::new(&env, SandboxConfig::new(0x247)) {
-        Ok(sandbox) => sandbox,
-        Err(error) => {
-            emit_failure(started, "sandbox", "initialize", &format!("{error:?}"));
-            std::process::exit(1);
-        }
+
+    // Presented only so the monitor can refuse it; never used.
+    let secret = std::env::var("SYNTHETIC_MONITOR_SECRET").ok();
+    let endpoint = std::env::var("SYNTHETIC_MONITOR_RPC_URL").ok();
+    let max_settlement_attempts = std::env::var("SYNTHETIC_MONITOR_MAX_SETTLEMENT_ATTEMPTS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_MAX_SETTLEMENT_ATTEMPTS);
+    let fault = match std::env::var("SYNTHETIC_MONITOR_FAULT").as_deref() {
+        Ok("oracle_unavailable") => JourneyFault::OracleUnavailable,
+        Ok("oracle_stale") => JourneyFault::OracleStale,
+        Ok("underfunded_payer") => JourneyFault::UnderfundedPayer,
+        Ok(value) if value.starts_with("rpc_timeouts:") => JourneyFault::RpcTimeouts(
+            value["rpc_timeouts:".len()..].parse().unwrap_or(1),
+        ),
+        _ => JourneyFault::None,
     };
 
-    if let Err(error) = sandbox.token_mut().mint(&payer, AMOUNT) {
-        emit_failure(started, "token", "fund payer", &format!("{error:?}"));
-        std::process::exit(1);
-    }
-    if let Err(error) = sandbox.oracle_mut().set_price(&asset, ORACLE_PRICE) {
-        emit_failure(started, "oracle", "configure quote", &format!("{error:?}"));
-        std::process::exit(1);
-    }
+    let options = JourneyOptions {
+        secret: secret.as_deref(),
+        endpoint: endpoint.as_deref(),
+        max_settlement_attempts,
+        fault,
+        ..JourneyOptions::new()
+    };
 
-    match sandbox.run_primary_workflow(&env, &payer, &payee, &asset, AMOUNT) {
-        Ok(report)
-            if report.fee == EXPECTED_FEE
-                && report.oracle_price == ORACLE_PRICE
-                && report.payer_balance == EXPECTED_FEE
-                && report.payee_balance == AMOUNT - EXPECTED_FEE
-                && report.credential_free =>
-        {
+    match run_journey(&env, &options) {
+        Ok(pass) => {
             println!(
-                "{{\"status\":\"pass\",\"journey\":\"fund_quote_settle\",\"latency_ms\":{},\"steps\":{},\"settled_ledger\":{},\"dependency\":null}}",
+                "{{\"status\":\"pass\",\"journey\":\"{}\",\"latency_ms\":{},\"steps\":{},\"settled_ledger\":{},\"settlement_attempts\":{},\"dependency\":null}}",
+                JOURNEY_NAME,
                 started.elapsed().as_millis(),
-                report.steps,
-                report.settled_ledger,
+                pass.report.steps,
+                pass.report.settled_ledger,
+                pass.settlement_attempts,
             );
         }
-        Ok(report) => {
-            emit_failure(
-                started,
-                "workflow_assertion",
-                "verify settlement",
-                &format!(
-                    "unexpected report: fee={}, price={}, payer={}, payee={}, credential_free={}",
-                    report.fee,
-                    report.oracle_price,
-                    report.payer_balance,
-                    report.payee_balance,
-                    report.credential_free
-                ),
+        Err(failure) => {
+            let detail = match failure.error {
+                Some(error) => format!("{error:?}"),
+                None => "unexpected settlement report".to_string(),
+            };
+            println!(
+                "{{\"status\":\"fail\",\"journey\":\"{}\",\"latency_ms\":{},\"failed_step\":{},\"dependency\":{},\"detail\":{},\"retryable\":{},\"settlement_pending\":{},\"settlement_attempts\":{}}}",
+                JOURNEY_NAME,
+                started.elapsed().as_millis(),
+                json_string(failure.step),
+                json_string(failure.dependency.as_str()),
+                json_string(&detail),
+                failure.retryable,
+                failure.settlement_pending,
+                failure.settlement_attempts,
             );
-            std::process::exit(1);
-        }
-        Err(error) => {
-            let blame = sandbox
-                .calls()
-                .iter()
-                .find(|call| !call.allowed)
-                .map(|call| format!("{:?}.{:?}", call.adapter, call.operation))
-                .unwrap_or_else(|| "workflow".to_string());
-            emit_failure(started, &blame, "run primary workflow", &format!("{error:?}"));
             std::process::exit(1);
         }
     }
-}
-
-fn emit_failure(started: Instant, dependency: &str, step: &str, detail: &str) {
-    println!(
-        "{{\"status\":\"fail\",\"journey\":\"fund_quote_settle\",\"latency_ms\":{},\"failed_step\":{},\"dependency\":{},\"detail\":{}}}",
-        started.elapsed().as_millis(),
-        json_string(step),
-        json_string(dependency),
-        json_string(detail),
-    );
 }
 
 fn json_string(value: &str) -> String {

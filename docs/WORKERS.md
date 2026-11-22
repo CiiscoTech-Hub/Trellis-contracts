@@ -199,6 +199,48 @@ created the job).
   and rely on the dedupe keys and receipts for safety rather than on a single
   operator.
 
+## Cancelling a job
+
+`cancel_job(env, admin, job_id, reason)` stops a `Pending` or `DeadLettered`
+job for good (Issue #444). It is admin-only and does all of its cleanup in one
+call:
+
+- the job leaves the pending and dead-letter indexes, so it stops counting
+  against queue capacity and `run_due_job` never picks it again;
+- the dedupe key is released, so the same logical work can be enqueued again
+  later as a new job;
+- the job record is kept with status `Cancelled`, and a `CancellationRecord`
+  (previous status, attempts so far, reason code, admin, ledger) is written
+  beside it. Read it with `get_cancellation(env, job_id)`;
+- a `("job", "cancelled", job_id)` event is published.
+
+Edge cases:
+
+| Situation | Result |
+|---|---|
+| Job is in backoff between attempts | Cancelled; the next attempt never happens |
+| Job already succeeded | `JobError::AlreadyCompleted`, nothing changes |
+| Job already cancelled | `Ok(job)`; the first `CancellationRecord` is kept, so a retried cancel is safe |
+| Unknown id | `JobError::NotFound` |
+| Caller is not the admin | `JobError::Unauthorized`, nothing changes |
+| `run_due_job` / `reprocess_job` on a cancelled id | The scheduler skips it; `reprocess_job` returns `JobError::Cancelled` |
+| `requeue_dead_letter` on a cancelled id | `JobError::NotRetryable` |
+
+A handler is never interrupted mid-attempt. Soroban executes one invocation at
+a time, so a cancellation always lands between attempts. Handlers must still be
+idempotent: if an attempt failed after partly changing state, the job is not
+retried once it is cancelled, so the domain contract has to compensate if
+needed.
+
+**Recovery and rollback.** Cancellation is final for that job id. To undo one,
+enqueue the work again with the same dedupe key. The new job gets a fresh id
+and a fresh attempt budget, and the cancelled record stays for audit.
+
+**Compatibility.** `JobStatus::Cancelled`, `JobError::Cancelled` and
+`WorkerKey::Cancellation` are appended variants, and the cancellation data
+lives under its own key instead of on `Job`. Jobs stored before this change
+decode unchanged, so no migration is needed.
+
 ## Local development
 
 ### 1. Build and test the framework

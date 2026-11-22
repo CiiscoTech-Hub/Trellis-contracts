@@ -122,9 +122,12 @@ impl From<SchemaEvolutionError> for Error {
         match err {
             SchemaEvolutionError::UnsupportedVersion => Error::UnsupportedSchemaVersion,
             SchemaEvolutionError::MissingRequiredField => Error::InvalidArgument,
-            SchemaEvolutionError::UnknownField => Error::UnknownField,
-            SchemaEvolutionError::DeprecatedField => Error::DeprecatedField,
-            SchemaEvolutionError::TombstonedField => Error::DeprecatedField,
+            // No dedicated shared::Error codes exist for field-level schema
+            // violations; map onto existing stable codes instead of adding
+            // new ones to the public error enum.
+            SchemaEvolutionError::UnknownField => Error::InvalidArgument,
+            SchemaEvolutionError::DeprecatedField => Error::UnsupportedSchemaVersion,
+            SchemaEvolutionError::TombstonedField => Error::UnsupportedSchemaVersion,
             SchemaEvolutionError::MigrationRequired => Error::UnsupportedSchemaVersion,
             SchemaEvolutionError::IncompatibleRange => Error::ConfigInvalid,
             SchemaEvolutionError::MigrationFailed => Error::SchemaMigrationFailed,

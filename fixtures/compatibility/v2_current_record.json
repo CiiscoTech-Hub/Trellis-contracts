@@ -1,0 +1,27 @@
+{
+  "schema_version": 2,
+  "description": "Current V2 aid record containing explicit token binding and schema_version metadata",
+  "records": [
+    {
+      "id": 1001,
+      "donor": "GBZXN7PIRZGNMHGA728RGRFZAPPWN9G8VDGSQZ85W7K8VN9PIRZGNMHG",
+      "recipient": "GA728RGRFZAPPWN9G8VDGSQZ85W7K8VN9PIRZGNMHGBZXN7PIRZGNMHG",
+      "token": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+      "amount": "5000000000",
+      "expiry_ledger": 125000,
+      "status": "Pending",
+      "schema_version": 2
+    },
+    {
+      "id": 1002,
+      "donor": "GBZXN7PIRZGNMHGA728RGRFZAPPWN9G8VDGSQZ85W7K8VN9PIRZGNMHG",
+      "recipient": "GC4K666M354VBH5S54R3P5TCHMVN5Y2F5Q2Z6T2X5F8H5J2L4M6N8P1Q",
+      "token": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+      "amount": "2500000000",
+      "expiry_ledger": 130000,
+      "status": "Settled",
+      "schema_version": 2
+    }
+  ]
+}
+

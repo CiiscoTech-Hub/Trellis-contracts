@@ -671,6 +671,93 @@ pub fn generate_export(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Field-level authorization (Issue #294)
+// ---------------------------------------------------------------------------
+
+/// Safe fields that still describe one person's financial position, location
+/// or standing. They are only shown to the record's owner or under
+/// [`ExportScope::Full`]; an operator viewing someone else's record under
+/// [`ExportScope::Operational`] gets the record without them.
+pub fn is_personal_field(field: &Symbol) -> bool {
+    field == &symbol_short!("amount")
+        || field == &symbol_short!("region")
+        || field == &symbol_short!("role")
+        || field == &symbol_short!("tier")
+}
+
+/// Field-level authorization decision for one field of one record.
+///
+/// - Forbidden or non-allow-listed fields are never visible.
+/// - The record owner, and [`ExportScope::Full`], see every safe field.
+/// - Anyone else sees only safe, non-personal fields.
+pub fn field_visible_to(scope: ExportScope, field: &Symbol, caller_is_owner: bool) -> bool {
+    if is_forbidden_field(field) || !is_safe_field(field) {
+        return false;
+    }
+    if caller_is_owner || scope == ExportScope::Full {
+        return true;
+    }
+    !is_personal_field(field)
+}
+
+/// An export with field-level authorization applied.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FieldScopedExport {
+    /// The artifact, with each record's fields filtered for the caller.
+    pub artifact: ExportArtifact,
+    /// Safe fields withheld by field-level authorization (in addition to
+    /// `artifact.report.redacted_fields`, which counts allow-list drops).
+    pub withheld_fields: u32,
+}
+
+/// [`generate_export`] plus field-level authorization ([`field_visible_to`]).
+///
+/// Opt-in so the existing `generate_export` contract is unchanged; see
+/// `docs/PRIVACY_SAFE_EXPORT.md` for the migration plan. Record-level scope,
+/// size limits, validation and metadata are exactly those of
+/// [`generate_export`], which runs first. The output is a pure function of
+/// its inputs and the ledger, so a failed delivery can be retried by simply
+/// generating again.
+pub fn generate_field_scoped_export(
+    env: &Env,
+    caller: &Address,
+    request: &ExportRequest,
+    records: &Vec<ExportRecord>,
+) -> Result<FieldScopedExport, ExportError> {
+    let artifact = generate_export(env, caller, request, records)?;
+
+    let mut withheld_fields: u32 = 0;
+    let mut scoped: Vec<ExportRecord> = Vec::new(env);
+    for i in 0..artifact.records.len() {
+        let Some(record) = artifact.records.get(i) else {
+            continue;
+        };
+        let caller_is_owner = record.owner == *caller;
+        let mut fields: Vec<ExportField> = Vec::new(env);
+        for j in 0..record.fields.len() {
+            let Some(field) = record.fields.get(j) else {
+                continue;
+            };
+            if field_visible_to(request.scope, &field.name, caller_is_owner) {
+                fields.push_back(field);
+            } else {
+                withheld_fields = withheld_fields.saturating_add(1);
+            }
+        }
+        scoped.push_back(ExportRecord { fields, ..record });
+    }
+
+    Ok(FieldScopedExport {
+        artifact: ExportArtifact {
+            records: scoped,
+            ..artifact
+        },
+        withheld_fields,
+    })
+}
+
 /// Register a generated artifact with the retention module under
 /// [`DataClass::Export`] so the standard cleanup workflow reclaims it.
 ///
@@ -1736,4 +1823,155 @@ mod tests {
         });
     }
 
+    // -----------------------------------------------------------------------
+    // Issue #294: field-level authorization
+    // -----------------------------------------------------------------------
+
+    fn detailed_record(env: &Env, id: &str, owner: &Address) -> ExportRecord {
+        let mut fields = Vec::new(env);
+        fields.push_back(field(env, "status", "settled"));
+        fields.push_back(field(env, "amount", "1000"));
+        fields.push_back(field(env, "region", "eu-west"));
+        fields.push_back(field(env, "tier", "gold"));
+        fields.push_back(field(env, "ssn", "000-00-0000"));
+        ExportRecord {
+            fields,
+            ..record(env, id, owner, RecordSensitivity::Operational)
+        }
+    }
+
+    fn names(record: &ExportRecord) -> Vec<Symbol> {
+        let mut out = Vec::new(record.fields.env());
+        for i in 0..record.fields.len() {
+            out.push_back(record.fields.get(i).unwrap().name);
+        }
+        out
+    }
+
+    #[test]
+    fn owner_sees_every_safe_field_of_their_own_record() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let mut records = Vec::new(&env);
+        records.push_back(detailed_record(&env, "r1", &owner));
+
+        let out = generate_field_scoped_export(&env, &owner, &request(ExportScope::OwnRecords), &records)
+            .unwrap();
+        let exported = out.artifact.records.get(0).unwrap();
+        assert_eq!(exported.fields.len(), 4);
+        assert_eq!(out.withheld_fields, 0);
+        // The forbidden field was dropped by the allow-list, not by field policy.
+        assert_eq!(out.artifact.report.redacted_fields, 1);
+    }
+
+    #[test]
+    fn operator_does_not_see_personal_fields_of_other_users() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let support = Address::generate(&env);
+        let owner = Address::generate(&env);
+        with_storage(&env, || {
+            persistent_set(&env, &DataKey::Role(support.clone(), Role::Support), &true);
+            let mut records = Vec::new(&env);
+            records.push_back(detailed_record(&env, "r1", &owner));
+            // A record the operator owns keeps its personal fields.
+            records.push_back(detailed_record(&env, "r2", &support));
+
+            let out =
+                generate_field_scoped_export(&env, &support, &request(ExportScope::Operational), &records)
+                    .unwrap();
+            let theirs = out.artifact.records.get(0).unwrap();
+            assert_eq!(names(&theirs), Vec::from_array(&env, [symbol_short!("status")]));
+            let own = out.artifact.records.get(1).unwrap();
+            assert_eq!(own.fields.len(), 4);
+            assert_eq!(out.withheld_fields, 3);
+            assert_eq!(out.artifact.metadata.record_count, 2);
+        });
+    }
+
+    #[test]
+    fn full_scope_admin_sees_all_safe_fields_but_never_forbidden_ones() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let owner = Address::generate(&env);
+        with_storage(&env, || {
+            persistent_set(&env, &DataKey::Role(admin.clone(), Role::Admin), &true);
+            let mut records = Vec::new(&env);
+            records.push_back(detailed_record(&env, "r1", &owner));
+
+            let out = generate_field_scoped_export(&env, &admin, &request(ExportScope::Full), &records)
+                .unwrap();
+            let exported = out.artifact.records.get(0).unwrap();
+            assert_eq!(exported.fields.len(), 4);
+            assert_eq!(out.withheld_fields, 0);
+            for i in 0..exported.fields.len() {
+                assert!(!is_forbidden_field(&exported.fields.get(i).unwrap().name));
+            }
+        });
+    }
+
+    #[test]
+    fn field_scoped_export_keeps_scope_authorization_and_limits() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let stranger = Address::generate(&env);
+        let owner = Address::generate(&env);
+        with_storage(&env, || {
+            let mut records = Vec::new(&env);
+            records.push_back(detailed_record(&env, "r1", &owner));
+            assert_eq!(
+                generate_field_scoped_export(&env, &stranger, &request(ExportScope::Operational), &records),
+                Err(ExportError::ScopeDenied)
+            );
+
+            // Own-records scope still hides other people's records entirely.
+            let out =
+                generate_field_scoped_export(&env, &stranger, &request(ExportScope::OwnRecords), &records)
+                    .unwrap();
+            assert_eq!(out.artifact.records.len(), 0);
+            assert_eq!(out.artifact.report.suppressed_out_of_scope, 1);
+
+            let mut too_many = request(ExportScope::OwnRecords);
+            too_many.max_records = 1;
+            let mut mine = Vec::new(&env);
+            mine.push_back(detailed_record(&env, "a", &stranger));
+            mine.push_back(detailed_record(&env, "b", &stranger));
+            assert_eq!(
+                generate_field_scoped_export(&env, &stranger, &too_many, &mine),
+                Err(ExportError::ExportTooLarge)
+            );
+        });
+    }
+
+    #[test]
+    fn field_scoped_export_is_deterministic_for_retries() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let owner = Address::generate(&env);
+        let mut records = Vec::new(&env);
+        records.push_back(detailed_record(&env, "r1", &owner));
+        let req = request(ExportScope::OwnRecords);
+
+        let first = generate_field_scoped_export(&env, &owner, &req, &records).unwrap();
+        let retry = generate_field_scoped_export(&env, &owner, &req, &records).unwrap();
+        assert_eq!(first, retry);
+    }
+
+    #[test]
+    fn field_visibility_matrix() {
+        let env = Env::default();
+        let amount = symbol_short!("amount");
+        let status = symbol_short!("status");
+        let wallet = Symbol::new(&env, "wallet");
+        let secret = symbol_short!("sec_key");
+
+        assert!(field_visible_to(ExportScope::Operational, &status, false));
+        assert!(!field_visible_to(ExportScope::Operational, &amount, false));
+        assert!(field_visible_to(ExportScope::Operational, &amount, true));
+        assert!(field_visible_to(ExportScope::Full, &amount, false));
+        assert!(!field_visible_to(ExportScope::Full, &wallet, false));
+        assert!(!field_visible_to(ExportScope::Full, &secret, true));
+    }
 }

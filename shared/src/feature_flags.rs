@@ -184,6 +184,21 @@ pub fn set_flag(
     if rollout_bps > FULL_ROLLOUT_BPS {
         return Err(FeatureFlagError::InvalidRollout);
     }
+    if enabled {
+        // Issue #295: a flag whose rollout guard tripped must not be switched
+        // back on directly — that would skip rollback verification. Only
+        // `rearm_after_verified_rollback` (which moves the guard off
+        // `RolledBack` first) may re-enable it.
+        let target = crate::rollout_guard::RolloutTarget::Flag(*flag);
+        let guard = crate::rollout_guard::get_guard_config(env, target);
+        if guard.stage == crate::rollout_guard::RolloutStage::RolledBack {
+            return Err(if crate::rollout_guard::is_rollback_verified(env, target) {
+                FeatureFlagError::AlreadyRolledBack
+            } else {
+                FeatureFlagError::UnverifiedRollbackReenableForbidden
+            });
+        }
+    }
     let config = FeatureFlagConfig {
         enabled,
         rollout_bps: if enabled { rollout_bps } else { 0 },

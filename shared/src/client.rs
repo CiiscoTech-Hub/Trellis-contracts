@@ -3,8 +3,8 @@
 //! Provides canonical shared types, envelopes, receipts, and schema fingerprinting
 //! ensuring that frontend (SDK), API server, and smart contracts remain perfectly aligned.
 
-use soroban_sdk::{contracttype, symbol_short, Address, BytesN, Env, Symbol};
 use crate::error_taxonomy::{describe_error, ErrorDomain};
+use soroban_sdk::{contracttype, symbol_short, Address, BytesN, Env, Symbol};
 
 /// Current canonical schema version for cross-repo Trellis integration.
 pub const CLIENT_SCHEMA_VERSION: u32 = 1;
@@ -203,6 +203,9 @@ pub fn format_client_error(
         ErrorDomain::Upgradeability => symbol_short!("upg"),
         ErrorDomain::Import => symbol_short!("import"),
         ErrorDomain::Export => symbol_short!("export"),
+        ErrorDomain::SupportAccess => symbol_short!("support"),
+        ErrorDomain::Jobs => symbol_short!("jobs"),
+        ErrorDomain::FeatureFlags => symbol_short!("flags"),
     };
 
     let cat_sym = match info.category {

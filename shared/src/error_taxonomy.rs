@@ -22,6 +22,11 @@ pub enum ErrorDomain {
     Upgradeability,
     Import,
     Export,
+    SupportAccess,
+    Jobs,
+    /// `shared::feature_flags::FeatureFlagError` (960–968). Appended last so
+    /// existing variants keep their encoding (#289).
+    FeatureFlags,
 }
 
 /// Broad class used by clients to choose safe recovery behavior.
@@ -451,20 +456,6 @@ fn domain_definition(domain: &ErrorDomain, code: u32) -> Option<Definition> {
                 "This service has already been initialized.",
                 Some("Contact a maintainer if the initialization is unexpected."),
             ),
-            505 => definition(
-                "INVALID_PRICE",
-                ErrorCategory::Validation,
-                false,
-                "The submitted price is not valid.",
-                Some("Submit a positive price within the allowed range."),
-            ),
-            506 => definition(
-                "INVALID_DECIMALS",
-                ErrorCategory::Validation,
-                false,
-                "The price precision is not supported.",
-                Some("Submit the price using the feed's configured decimals."),
-            ),
             511 => definition(
                 "INVALID_QUORUM",
                 ErrorCategory::Validation,
@@ -516,34 +507,6 @@ fn domain_definition(domain: &ErrorDomain, code: u32) -> Option<Definition> {
                 false,
                 "The operation could not be completed.",
                 Some("Contact support and provide the reference ID."),
-            ),
-            201 => definition(
-                "ROLE_ALREADY_EXISTS",
-                ErrorCategory::Conflict,
-                false,
-                "That role already exists.",
-                Some("Use the existing role or choose a different role name."),
-            ),
-            202 => definition(
-                "ALREADY_MEMBER",
-                ErrorCategory::Conflict,
-                false,
-                "This account already holds the role.",
-                Some("No action is needed. Check the account's current roles."),
-            ),
-            203 => definition(
-                "NOT_MEMBER",
-                ErrorCategory::NotFound,
-                false,
-                "This account does not hold the role.",
-                Some("Check the account address and role name."),
-            ),
-            204 => definition(
-                "VALIDATION_FAILED",
-                ErrorCategory::Validation,
-                false,
-                "A role cannot be a parent of itself.",
-                Some("Choose a different parent role."),
             ),
             215 => definition(
                 "CONTRACT_PAUSED",
@@ -666,41 +629,6 @@ fn domain_definition(domain: &ErrorDomain, code: u32) -> Option<Definition> {
                 true,
                 "This action is temporarily unavailable while the service is paused.",
                 Some("Try again after the service has resumed."),
-            ),
-            2006 => definition(
-                "INVALID_METADATA_HASH",
-                ErrorCategory::Validation,
-                false,
-                "The metadata hash is not valid.",
-                Some("Submit a 32-byte metadata hash in the documented format."),
-            ),
-            2007 => definition(
-                "INVALID_ROYALTY",
-                ErrorCategory::Validation,
-                false,
-                "The royalty rate is outside the allowed range.",
-                Some("Submit a royalty rate within the documented maximum."),
-            ),
-            2008 => definition(
-                "INVALID_EXTENSION_WINDOW",
-                ErrorCategory::Validation,
-                false,
-                "The auction extension window is not valid.",
-                Some("Submit an extension window within the documented limits."),
-            ),
-            2017 => definition(
-                "INVALID_DUTCH_PRICES",
-                ErrorCategory::Validation,
-                false,
-                "The Dutch auction prices are not valid.",
-                Some("Set a starting price higher than the ending price."),
-            ),
-            2018 => definition(
-                "INVALID_AMOUNT",
-                ErrorCategory::Validation,
-                false,
-                "The amount is not valid.",
-                Some("Submit an amount within the allowed range."),
             ),
             _ => return None,
         }),
@@ -1054,6 +982,72 @@ fn domain_definition(domain: &ErrorDomain, code: u32) -> Option<Definition> {
             ),
             _ => return None,
         }),
+        ErrorDomain::Jobs => Some(match code {
+            1 => definition(
+                "WORKER_DISABLED",
+                ErrorCategory::Configuration,
+                true,
+                "The background worker is paused.",
+                Some("Wait for an administrator to resume the worker."),
+            ),
+            2 => definition(
+                "WORKER_INVALID_POLICY",
+                ErrorCategory::Configuration,
+                false,
+                "The retry policy is invalid.",
+                Some("Correct the policy before submitting work."),
+            ),
+            3 => definition(
+                "JOB_NOT_FOUND",
+                ErrorCategory::NotFound,
+                false,
+                "The requested job does not exist.",
+                Some("Check the job ID and restore archived state if needed."),
+            ),
+            4 => definition(
+                "JOB_ALREADY_COMPLETED",
+                ErrorCategory::Conflict,
+                false,
+                "The job has already completed.",
+                Some("Use the stored completion receipt."),
+            ),
+            5 => definition(
+                "JOB_NOT_DUE",
+                ErrorCategory::Conflict,
+                true,
+                "The job is not due yet.",
+                Some("Wait until the next attempt ledger."),
+            ),
+            6 => definition(
+                "JOB_NOT_RETRYABLE",
+                ErrorCategory::Conflict,
+                false,
+                "The job cannot be retried in its current state.",
+                Some("Inspect the job and request administrative recovery."),
+            ),
+            7 => definition(
+                "WORKER_UNAUTHORIZED",
+                ErrorCategory::Authorization,
+                false,
+                "You are not authorized to manage the worker.",
+                Some("Use the configured administrator account."),
+            ),
+            8 => definition(
+                "WORKER_QUEUE_FULL",
+                ErrorCategory::Conflict,
+                true,
+                "The background work queue is full.",
+                Some("Drain pending work or discard resolved dead letters before retrying."),
+            ),
+            9 => definition(
+                "WORKER_INVALID_CAPACITY",
+                ErrorCategory::Configuration,
+                false,
+                "The queue capacity is invalid.",
+                Some("Set a capacity between 1 and 256."),
+            ),
+            _ => return None,
+        }),
         ErrorDomain::Import => Some(match code {
             940 => definition(
                 "BATCH_TOO_LARGE",
@@ -1225,6 +1219,154 @@ fn domain_definition(domain: &ErrorDomain, code: u32) -> Option<Definition> {
                 false,
                 "You are not authorized to export data from this module.",
                 Some("Use an account with export access to this module."),
+            ),
+            _ => return None,
+        }),
+        ErrorDomain::SupportAccess => Some(match code {
+            960 => definition(
+                "SUPPORT_SESSION_NOT_FOUND",
+                ErrorCategory::NotFound,
+                false,
+                "The support-access session is not active.",
+                Some("Refresh the session state or request a new authorized session."),
+            ),
+            961 => definition(
+                "SUPPORT_ACCESS_UNAUTHORIZED",
+                ErrorCategory::Authorization,
+                false,
+                "You are not authorized to open or use support access.",
+                Some("Contact an administrator to request the Support role."),
+            ),
+            962 | 970 => definition(
+                "SUPPORT_SCOPE_INVALID",
+                ErrorCategory::Validation,
+                false,
+                "The support-access scope or duration is invalid.",
+                Some("Choose an explicit resource scope and a positive duration."),
+            ),
+            963 => definition(
+                "SUPPORT_DURATION_TOO_LONG",
+                ErrorCategory::Validation,
+                false,
+                "The support-access duration exceeds the allowed maximum.",
+                Some("Choose a duration of one hour or less."),
+            ),
+            964 => definition(
+                "SUPPORT_SESSION_EXPIRED",
+                ErrorCategory::Conflict,
+                false,
+                "The support-access session has expired.",
+                Some("Request a new authorized session if support access is still needed."),
+            ),
+            965 | 966 => definition(
+                "SUPPORT_ACTION_NOT_PERMITTED",
+                ErrorCategory::Authorization,
+                false,
+                "This action is outside the support-access scope.",
+                Some("Use an authorized session with the minimum required scope."),
+            ),
+            967 | 969 => definition(
+                "SUPPORT_SESSION_LIMIT",
+                ErrorCategory::Conflict,
+                false,
+                "The support-access session limit has been reached.",
+                Some("Revoke or allow an existing session to expire before retrying."),
+            ),
+            968 => definition(
+                "SUPPORT_TARGET_NOT_ALLOWED",
+                ErrorCategory::Authorization,
+                false,
+                "This account cannot be accessed through support impersonation.",
+                Some("Use an eligible end-user account."),
+            ),
+            971 => definition(
+                "SUPPORT_AUDIT_UNAVAILABLE",
+                ErrorCategory::Internal,
+                false,
+                "Support access could not be recorded safely.",
+                Some("Stop the operation and have an operator verify the audit ledger."),
+            ),
+            972 => definition(
+                "SUPPORT_SESSION_ID_EXHAUSTED",
+                ErrorCategory::Internal,
+                false,
+                "A support session could not be created safely.",
+                Some("Stop support access changes and contact an operator."),
+            ),
+            973 => definition(
+                "SUPPORT_TIMESTAMP_OVERFLOW",
+                ErrorCategory::Internal,
+                false,
+                "A support session could not be created safely.",
+                Some("Stop support access changes and contact an operator."),
+            ),
+            _ => return None,
+        }),
+        // Issue #289: FeatureFlagError shares the 960s with support access and
+        // backfill errors; this domain gives its codes their own stable meaning.
+        ErrorDomain::FeatureFlags => Some(match code {
+            960 => definition(
+                "FEATURE_ROLLOUT_INVALID",
+                ErrorCategory::Validation,
+                false,
+                "The rollout percentage is out of range.",
+                Some("Use a rollout weight between 0 and 10000 basis points."),
+            ),
+            961 => definition(
+                "FEATURE_DISABLED",
+                ErrorCategory::Configuration,
+                false,
+                "This feature is not enabled.",
+                Some("Use the existing flow; the feature is off or not rolled out yet."),
+            ),
+            962 => definition(
+                "FEATURE_GUARD_BLOCKED",
+                ErrorCategory::Configuration,
+                true,
+                "This feature is temporarily unavailable.",
+                Some("Use the existing flow and retry after the rollout guard reports healthy."),
+            ),
+            963 => definition(
+                "FEATURE_ROLLED_BACK",
+                ErrorCategory::Configuration,
+                false,
+                "This feature was rolled back after failures.",
+                Some("Use the existing flow. Operators: run verify_rollback before re-arming."),
+            ),
+            964 => definition(
+                "ROLLBACK_VERIFICATION_FAILED",
+                ErrorCategory::Internal,
+                false,
+                "The feature rollback could not be confirmed as clean.",
+                Some("Keep the feature disabled, repair the reported anomaly, then verify again."),
+            ),
+            965 => definition(
+                "ROLLBACK_STATE_INCONSISTENT",
+                ErrorCategory::Internal,
+                false,
+                "Inconsistent state was found after a feature rollback.",
+                Some("Keep the feature disabled and reconcile the affected records before verifying again."),
+            ),
+            966 => definition(
+                "FEATURE_ALREADY_ROLLED_BACK",
+                ErrorCategory::Conflict,
+                false,
+                "This feature is in a rolled-back state.",
+                Some("Re-enable it only through rearm_after_verified_rollback after a clean verification."),
+            ),
+            967 => definition(
+                "ROLLOUT_GUARD_CONFIG_INVALID",
+                ErrorCategory::Validation,
+                false,
+                "The rollout guard settings are invalid.",
+                Some("Set max_consecutive_failures above zero and max_error_rate_bps to at most 10000."),
+            ),
+            968 => definition(
+                "ROLLBACK_NOT_VERIFIED",
+                ErrorCategory::Conflict,
+                false,
+                "This feature cannot be re-enabled until its rollback is verified.",
+                Some("Run verify_rollback with a clean consistency snapshot, then rearm the feature."),
             ),
             _ => return None,
         }),
@@ -1492,8 +1634,11 @@ mod tests {
             (ErrorDomain::Oracle, 500, 511),
             (ErrorDomain::Upgradeability, 900, 915),
             (ErrorDomain::Import, 940, 949),
+            (ErrorDomain::Jobs, 1, 9),
             (ErrorDomain::Export, 920, 934),
             (ErrorDomain::Marketplace, 2000, 2023),
+            (ErrorDomain::SupportAccess, 960, 973),
+            (ErrorDomain::FeatureFlags, 960, 968),
         ];
 
         for (domain, first, last) in ranges {
@@ -1550,7 +1695,10 @@ mod tests {
             (ErrorDomain::Upgradeability, 900, 915),
             (ErrorDomain::Export, 920, 934),
             (ErrorDomain::Import, 940, 949),
+            (ErrorDomain::Jobs, 1, 9),
             (ErrorDomain::Marketplace, 2000, 2023),
+            (ErrorDomain::SupportAccess, 960, 973),
+            (ErrorDomain::FeatureFlags, 960, 968),
         ];
 
         for (domain, first, last) in ranges {
@@ -1625,5 +1773,62 @@ mod tests {
         assert_eq!(reg_err.code, String::from_str(&env, "CONTRACT_NOT_FOUND"));
         assert_eq!(reg_err.category, ErrorCategory::NotFound);
     }
-}
 
+    // Issue #289: feature-flag errors get stable, domain-specific codes.
+    #[test]
+    fn feature_flag_errors_have_stable_codes_and_remediation() {
+        use crate::feature_flags::FeatureFlagError as F;
+
+        let env = Env::default();
+        let expected = [
+            (F::InvalidRollout, "FEATURE_ROLLOUT_INVALID", ErrorCategory::Validation, false),
+            (F::Disabled, "FEATURE_DISABLED", ErrorCategory::Configuration, false),
+            (F::GuardBlocked, "FEATURE_GUARD_BLOCKED", ErrorCategory::Configuration, true),
+            (F::AutomaticRollbackTriggered, "FEATURE_ROLLED_BACK", ErrorCategory::Configuration, false),
+            (F::RollbackVerificationFailed, "ROLLBACK_VERIFICATION_FAILED", ErrorCategory::Internal, false),
+            (F::InconsistentStateDetected, "ROLLBACK_STATE_INCONSISTENT", ErrorCategory::Internal, false),
+            (F::AlreadyRolledBack, "FEATURE_ALREADY_ROLLED_BACK", ErrorCategory::Conflict, false),
+            (F::InvalidGuardConfig, "ROLLOUT_GUARD_CONFIG_INVALID", ErrorCategory::Validation, false),
+            (
+                F::UnverifiedRollbackReenableForbidden,
+                "ROLLBACK_NOT_VERIFIED",
+                ErrorCategory::Conflict,
+                false,
+            ),
+        ];
+
+        for (error, code, category, retryable) in expected {
+            let raw = error as u32;
+            let info = describe_error(&env, ErrorDomain::FeatureFlags, raw, correlation_id(&env));
+            assert_eq!(info.code, String::from_str(&env, code), "{error:?}");
+            assert_eq!(stable_code(ErrorDomain::FeatureFlags, raw), code);
+            assert_eq!(info.category, category, "{error:?}");
+            assert_eq!(info.retryable, retryable, "{error:?}");
+            assert!(info.recovery.is_some(), "{error:?} needs a remediation hint");
+        }
+    }
+
+    #[test]
+    fn feature_flag_codes_do_not_inherit_support_access_meanings() {
+        let env = Env::default();
+        // 961 is FeatureFlagError::Disabled and ImpersonationError's
+        // unauthorized code; the domain decides which one applies.
+        let flag = describe_error(&env, ErrorDomain::FeatureFlags, 961, correlation_id(&env));
+        let support = describe_error(&env, ErrorDomain::SupportAccess, 961, correlation_id(&env));
+        assert_eq!(flag.code, String::from_str(&env, "FEATURE_DISABLED"));
+        assert_eq!(support.code, String::from_str(&env, "SUPPORT_ACCESS_UNAUTHORIZED"));
+        assert_ne!(flag.category, support.category);
+
+        // Unassigned codes in the flag range still fall back safely.
+        assert_eq!(stable_code(ErrorDomain::FeatureFlags, 969), UNEXPECTED_ERROR_CODE);
+    }
+
+    #[test]
+    fn rollout_guard_rejections_are_never_retryable_except_guard_blocked() {
+        let env = Env::default();
+        for raw in 960..=968u32 {
+            let info = describe_error(&env, ErrorDomain::FeatureFlags, raw, correlation_id(&env));
+            assert_eq!(info.retryable, raw == 962, "code {raw}");
+        }
+    }
+}

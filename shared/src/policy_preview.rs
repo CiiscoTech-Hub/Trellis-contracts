@@ -548,6 +548,11 @@ pub fn get_simulation_preview(
         .ok_or(PolicySimulationError::SimulationPreviewExpired)
 }
 
+/// Whether the previewed change is a destructive maintainer action.
+pub fn is_destructive(preview: &PolicySimulationPreview) -> bool {
+    matches!(preview.severity, PolicyImpactSeverity::High | PolicyImpactSeverity::Critical)
+        || !preview.rollback_constraints.is_reversible
+}
 /// Validates that a simulation preview is valid, non-expired, and eligible for commit.
 pub fn validate_preview_for_commit(
     env: &Env,
