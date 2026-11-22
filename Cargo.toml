@@ -16,6 +16,7 @@ members = [
     "contracts/rebalancer-contract",
     "contracts/nft-marketplace",
     "contracts/signed-audit-receipts",
+    "contracts/retention-enforcement",
 ]
 
 [workspace.dependencies]
