@@ -11,7 +11,11 @@ extern crate std;
 
 use std::format;
 
-use soroban_sdk::{contract, contractimpl, Bytes, Env, Vec};
+use soroban_sdk::{
+    contract, contractimpl,
+    testutils::Events as _,
+    Bytes, Env, Vec,
+};
 
 use crate::errors::Error;
 use crate::pagination::{
@@ -29,6 +33,7 @@ use crate::telemetry::{
 const HIGH_CARDINALITY_KEYS: u32 = 1_000;
 const LABEL_VALUES: u32 = 1_000;
 const TELEMETRY_EVENTS: u64 = 4_096;
+const BURST_EVENTS: u64 = 16_384;
 const PAGINATION_IDS: u64 = 10_000;
 
 const SECRET: &str = "SCZANGBA5YHTNYVS3ZSXQ7KFUNXAGMGKSSLTPJHLAOBQEVKUYNNVPFH";
@@ -151,6 +156,35 @@ fn telemetry_emits_only_sampled_events_under_load() {
     // One event survives per SAMPLE_DENOMINATOR correlation ids, so the count
     // is fixed by the volume rather than by timing or randomness.
     let expected = TELEMETRY_EVENTS.div_ceil(SAMPLE_DENOMINATOR as u64);
+    assert_eq!(env.events().all().len() as u64, expected);
+}
+
+#[test]
+fn burst_telemetry_stays_bounded_and_retries_are_idempotent() {
+    let env = Env::default();
+    env.budget().reset_unlimited();
+    let contract_id = env.register_contract(None, LoadHarness);
+
+    // A burst of failed-then-retried events: each retry reuses the same
+    // correlation id, so the sampled set must not grow with retry count.
+    env.as_contract(&contract_id, || {
+        for correlation_id in 0..BURST_EVENTS {
+            for _attempt in 0..2 {
+                publish_protected(
+                    &env,
+                    &TelemetryEvent {
+                        operation: OP_PAYMENT_TRANSFER,
+                        actor: ActorType::User,
+                        result: TelemetryResult::Failure,
+                        latency_ledgers: 1,
+                        correlation_id,
+                    },
+                );
+            }
+        }
+    });
+
+    let expected = BURST_EVENTS.div_ceil(SAMPLE_DENOMINATOR as u64) * 2;
     assert_eq!(env.events().all().len() as u64, expected);
 }
 

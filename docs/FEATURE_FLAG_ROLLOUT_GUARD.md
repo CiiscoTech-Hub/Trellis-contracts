@@ -1,4 +1,4 @@
-# Feature-Flag Rollout Guard with Automatic Rollback Verification (Issue #239)
+# Feature-Flag Rollout Guard with Automatic Rollback Verification (Issues #239, #295, #503)
 
 The Feature-Flag Rollout Guard provides a resilient, automated safety harness for introducing risky changes across the six core Soroban contract domains in Trellis:
 - **Treasury** (sweeps, category balance rebalancing, withdrawal limits)
@@ -169,6 +169,21 @@ pub fn verify_rollback(
 To prevent operators from prematurely re-enabling a faulty feature before the underlying issue has been identified and fixed:
 `rearm_after_verified_rollback` rejects any re-enablement with `FeatureFlagError::UnverifiedRollbackReenableForbidden` unless `verify_rollback` has produced a receipt where `verified_clean == true`.
 
+### Emergency Disablement Guardrails (Issue #295)
+
+Rearm used to be the only guarded path; two side doors could re-enable a rolled-back feature without verification. Both are now closed:
+
+| Path | Before | Now |
+|---|---|---|
+| `feature_flags::set_flag(flag, true, …)` while the flag's guard is `RolledBack` | Silently re-enabled the flag; `is_enabled` / `require_enabled` callers took the new path again | `UnverifiedRollbackReenableForbidden` (968) when unverified, `AlreadyRolledBack` (966) when verified; re-enable through `rearm_after_verified_rollback` |
+| `init_or_update_guard` with `enabled = false, stage = Canary`, then `enabled = true` | The first write moved the guard off `RolledBack`, so the second passed the check | Leaving `RolledBack` in any way requires a verified receipt; tuning thresholds while staying `RolledBack` is still allowed |
+
+Disabling is always allowed (`set_flag(flag, false, …)`, `emergency_disable`).
+
+**Authorized kill switch:** `emergency_stop(env, target, operator)` requires `Permission::PauseContracts` (a `Pauser` or the admin, plus the operator's signature). It trips a `ManualTrigger` rollback and publishes `("rollout", "estop")` with the operator address. Stopping is intentionally cheaper than resuming: any pauser can stop, but resuming still needs verification and a rearm.
+
+**Retries are safe:** calling `trigger_auto_rollback` / `emergency_stop` again on a target that is already `RolledBack` re-asserts the flag kill switch and returns the **original** audit record. The first root cause (e.g. `InvariantViolation`, failing code) and any verification receipt for that rollback are no longer overwritten by a runbook retry.
+
 ---
 
 ## 6. Operational Edge Cases & Failure Modes
@@ -187,7 +202,11 @@ To prevent operators from prematurely re-enabling a faulty feature before the un
 
 ### Edge Case 4: Rollback Re-Arming Race Condition
 - **Scenario**: An operator attempts to bump the canary percentage back up while an investigation is ongoing.
-- **Mitigation**: The guard enforces `is_rollback_verified`. Any attempt to set `enabled = true` without a passing `RollbackVerificationReceipt` returns `UnverifiedRollbackReenableForbidden`.
+- **Mitigation**: The guard enforces `is_rollback_verified`. Any attempt to set `enabled = true` without a passing `RollbackVerificationReceipt` returns `UnverifiedRollbackReenableForbidden`. This covers direct `set_flag` writes and two-step guard updates too (#295).
+
+### Edge Case 5: Migrating Contracts That Re-Enable Flags Directly
+- **Scenario**: A contract entry point re-enabled a feature after an incident with `set_flag(flag, true, bps)`.
+- **Mitigation**: That call now fails while the guard is `RolledBack`. Migrate the entry point to `verify_rollback` + `rearm_after_verified_rollback`. Flags with no guard configured (default stage `Disabled`) are unaffected, so contracts that never used the rollout guard need no change.
 
 ---
 

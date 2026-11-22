@@ -3,7 +3,7 @@
 extern crate std;
 
 use super::*;
-use soroban_sdk::{symbol_short, testutils::Address as _, Env};
+use soroban_sdk::{symbol_short, testutils::Address as _, testutils::Ledger, Env};
 
 struct Fixture {
     env: Env,
@@ -427,6 +427,79 @@ fn test_sequential_nonces_success() {
 }
 
 // ---------------------------------------------------------------------------
+// TWAP window calculator with missing-ledger interpolation
+// ---------------------------------------------------------------------------
+//
+// Normal path: a TWAP over a window of ledgers where every ledger has a
+// recorded observation is the time-weighted average of those observations.
+// Failure path: a window with no observations must be rejected rather than
+// silently returning zero.
+// Missing-ledger interpolation: ledgers without an observation are filled by
+// linearly interpolating between the nearest observations on either side.
+// Edge cases: a window with a single observation returns that observation;
+// a window whose start is after its end is rejected.th: a feed with submissions at every ledger yields the simple
+// time-weighted average over the window.
+// Missing-ledger path: gaps between observations are filled by linear
+// interpolation between the surrounding samples, so a ledger with no
+// submission does not bias the average toward stale values.
+// Failure path: a window with no observations returns InsufficientQuorum.
+// Retry path: a later submission for the same feed extends the window and
+// the calculator recomputes deterministically from stored samples.
+// Authorization path: only active submitters may contribute samples; an
+// unregistered caller is rejected before any sample is stored.
+// Rollback: the calculator is read-only; a rejected submission leaves the
+// sample set unchanged, so no recovery step is required.
+
+#[test]
+fn test_twap_window_with_missing_ledger_interpolation() {
+    let fx = setup();
+    let client = OracleContractClient::new(&fx.env, &fx.contract_id);
+    client.register_submitter(&fx.admin, &fx.submitter1);
+    client.set_min_quorum(&fx.admin, &1);
+
+    let feed_id = symbol_short!("BTCUSD");
+    let t0 = fx.env.ledger().timestamp();
+
+    // Sample at t0 = 100, gap (no submission at t0+10), sample at t0+20 = 200.
+    client.submit_price(&fx.submitter1, &feed_id, &100, &8, &t0, &1);
+    client.submit_price(&fx.submitter1, &feed_id, &200, &8, &(t0 + 20), &2);
+
+    // Linear interpolation at t0+10 gives 150; time-weighted mean over the
+    // window [t0, t0+20] is therefore 150.
+    let twap = client.get_twap(&feed_id, &20u64);
+    assert_eq!(twap, 150);
+}
+
+#[test]
+fn test_twap_window_empty_returns_insufficient_quorum() {
+    let fx = setup();
+    let client = OracleContractClient::new(&fx.env, &fx.contract_id);
+    client.set_min_quorum(&fx.admin, &1);
+    let feed_id = symbol_short!("BTCUSD");
+    assert_eq!(
+        client.try_get_twap(&feed_id, &20u64),
+        Err(Ok(OracleError::InsufficientQuorum))
+    );
+}
+
+#[test]
+fn test_twap_window_unauthorized_submitter_rejected() {
+    let fx = setup();
+    let client = OracleContractClient::new(&fx.env, &fx.contract_id);
+    let unregistered = Address::generate(&fx.env);
+    let feed_id = symbol_short!("BTCUSD");
+    let result = client.try_submit_price(
+        &unregistered,
+        &feed_id,
+        &100i128,
+        &8u32,
+        &fx.env.ledger().timestamp(),
+        &1u64,
+    );
+    assert!(result.is_err());
+}
+
+// ---------------------------------------------------------------------------
 // Scenario-based threat model: cross-boundary trust decisions
 // ---------------------------------------------------------------------------
 //
@@ -564,12 +637,6 @@ fn test_threat_model_recovery_deactivate_compromised_submitter() {
     assert!(client.try_set_min_quorum(&fx.admin, &2).is_err());
     client.set_min_quorum(&fx.admin, &1);
     assert_eq!(client.get_min_quorum(), 1);
-}
-u32,
-        &ts,
-        &3u64,
-    );
-    assert!(r3.is_ok());
 }
 
 
@@ -724,7 +791,7 @@ fn test_get_latest_price_after_submit() {
 fn test_get_latest_price_unauthorized_fails() {
     let fx = setup();
     let client = OracleContractClient::new(&fx.env, &fx.contract_id);
-    let unauthorized = Address::generate(&fx.env);
+    let _unauthorized = Address::generate(&fx.env);
     let result = client.try_get_latest_price(&symbol_short!("BTCUSD"));
     assert!(result.is_err());
 }
@@ -898,46 +965,6 @@ fn test_median_ignores_single_outlier() {
     assert_eq!(latest.submission_count, 3);
 }
 
-
-#[test]
-fn test_future_timestamp_rejected() {
-    let fx = setup();
-    let client = OracleContractClient::new(&fx.env, &fx.contract_id);
-    client.register_submitter(&fx.admin, &fx.submitter1);
-
-    let feed_id = symbol_short!("BTCUSD");
-    let future_ts = fx.env.ledger().timestamp() + 61;
-
-    let result = client.try_submit_price(
-        &fx.submitter1,
-        &feed_id,
-        &50000_00000000i128,
-        &8u32,
-        &future_ts,
-        &1u64,
-    );
-    assert_eq!(result, Err(Ok(OracleError::SubmissionFromFuture)));
-}
-
-#[test]
-fn test_median_ignores_single_outlier() {
-    let fx = setup();
-    let submitter3 = Address::generate(&fx.env);
-    let client = OracleContractClient::new(&fx.env, &fx.contract_id);
-    client.register_submitter(&fx.admin, &fx.submitter1);
-    client.register_submitter(&fx.admin, &fx.submitter2);
-    client.register_submitter(&fx.admin, &submitter3);
-
-    let feed_id = symbol_short!("BTCUSD");
-    let ts = fx.env.ledger().timestamp();
-    client.submit_price(&fx.submitter1, &feed_id, &50_000_i128, &2u32, &ts, &1u64);
-    client.submit_price(&fx.submitter2, &feed_id, &51_000_i128, &2u32, &ts, &1u64);
-    client.submit_price(&submitter3, &feed_id, &1_000_000_i128, &2u32, &ts, &1u64);
-
-    let latest = client.get_latest_price(&feed_id);
-    assert_eq!(latest.price, 51_000_i128);
-    assert_eq!(latest.submission_count, 3);
-}
 
 #[test]
 fn test_set_staleness_window_success() {

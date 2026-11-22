@@ -1,0 +1,27 @@
+{
+  "schema_version": 999,
+  "description": "Malformed compatibility test fixtures representing corrupted, negative amount, or unsupported schema records",
+  "records": [
+    {
+      "id": 9001,
+      "donor": "GBZXN7PIRZGNMHGA728RGRFZAPPWN9G8VDGSQZ85W7K8VN9PIRZGNMHG",
+      "recipient": "GA728RGRFZAPPWN9G8VDGSQZ85W7K8VN9PIRZGNMHGBZXN7PIRZGNMHG",
+      "amount": "-1000",
+      "expiry_ledger": 125000,
+      "status": "Pending",
+      "schema_version": 1,
+      "expected_error": "SchemaMigrationFailed"
+    },
+    {
+      "id": 9002,
+      "donor": "GBZXN7PIRZGNMHGA728RGRFZAPPWN9G8VDGSQZ85W7K8VN9PIRZGNMHG",
+      "recipient": "GA728RGRFZAPPWN9G8VDGSQZ85W7K8VN9PIRZGNMHGBZXN7PIRZGNMHG",
+      "amount": "5000000000",
+      "expiry_ledger": 125000,
+      "status": "Pending",
+      "schema_version": 99,
+      "expected_error": "UnsupportedSchemaVersion"
+    }
+  ]
+}
+

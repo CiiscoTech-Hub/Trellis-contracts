@@ -80,6 +80,9 @@ pub enum DataKey {
     SearchIndexCount,
     /// Authorized inspector address (persistent).
     Inspector(Address),
+    /// Region a recipient is assigned to, for regional disbursement controls
+    /// (Issue #539). Absent means the recipient is unmapped (fail-open).
+    RecipientRegion(Address),
 }
 
 pub const PAGE_SIZE: u32 = 50;
@@ -426,4 +429,19 @@ pub fn is_inspector(env: &Env, inspector: &Address) -> bool {
 
 pub fn set_inspector(env: &Env, inspector: &Address, enabled: bool) {
     persistent_set(env, &DataKey::Inspector(inspector.clone()), &enabled);
+}
+
+/// Region a recipient is mapped to, if any (Issue #539).
+pub fn get_recipient_region(env: &Env, recipient: &Address) -> Option<soroban_sdk::Symbol> {
+    persistent_get(env, &DataKey::RecipientRegion(recipient.clone()))
+}
+
+/// Map a recipient to a region used by regional disbursement controls.
+pub fn set_recipient_region(env: &Env, recipient: &Address, region: &soroban_sdk::Symbol) {
+    persistent_set(env, &DataKey::RecipientRegion(recipient.clone()), region);
+}
+
+/// Remove a recipient's region mapping (returns them to fail-open).
+pub fn clear_recipient_region(env: &Env, recipient: &Address) {
+    persistent_remove(env, &DataKey::RecipientRegion(recipient.clone()));
 }

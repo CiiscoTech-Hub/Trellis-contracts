@@ -8,8 +8,8 @@
 //! - High-cardinality telemetry protection: bounded label sets, redaction of sensitive
 //!   values, and deterministic sampling to keep dashboards useful under abusive input.
 
-use soroban_sdk::{Bytes, Env};
 use crate::errors::Error;
+use soroban_sdk::{Bytes, Env};
 
 /// Maximum allowed URL byte length to prevent storage bloat and resource exhaustion.
 pub const MAX_URL_LEN: u32 = 2048;
@@ -51,8 +51,11 @@ fn is_ascii_whitespace(b: u8) -> bool {
 }
 
 /// Helper function to convert an ASCII byte to lowercase without allocation.
+///
+/// `pub(crate)` so other shared modules (e.g. `allowlist`) can normalize
+/// bytes the same way this module does, instead of re-implementing it.
 #[inline]
-fn to_ascii_lower(b: u8) -> u8 {
+pub(crate) fn to_ascii_lower(b: u8) -> u8 {
     if (b'A'..=b'Z').contains(&b) {
         b + (b'a' - b'A')
     } else {
@@ -61,7 +64,10 @@ fn to_ascii_lower(b: u8) -> u8 {
 }
 
 /// Check if a byte slice matches a prefix case-insensitively.
-fn starts_with_case_insensitive(bytes: &Bytes, prefix: &[u8], offset: u32) -> bool {
+///
+/// `pub(crate)` so `allowlist` can reuse the same scheme-prefix matching
+/// this module uses, keeping scheme detection in one place.
+pub(crate) fn starts_with_case_insensitive(bytes: &Bytes, prefix: &[u8], offset: u32) -> bool {
     if bytes.len() < offset + (prefix.len() as u32) {
         return false;
     }
@@ -108,7 +114,11 @@ fn contains_case_insensitive(bytes: &Bytes, needle: &[u8]) -> bool {
 /// 3. Scheme matches an allowed safe prefix (`https://`, `ipfs://`, `ipns://`, `ar://`, `did:`, or `http://` if allowed).
 /// 4. Does not contain dangerous schemes (`javascript:`, `data:`, `file:`, `vbscript:`, `blob:`, `about:`).
 /// 5. For web schemes (`https://`, `http://`), ensures a non-empty domain/host exists.
-pub fn validate_external_url(url: &Bytes, max_len: u32, allow_http: bool) -> Result<SafeScheme, Error> {
+pub fn validate_external_url(
+    url: &Bytes,
+    max_len: u32,
+    allow_http: bool,
+) -> Result<SafeScheme, Error> {
     let len = url.len();
     if len == 0 || len > max_len {
         return Err(Error::InvalidArgument);
@@ -225,7 +235,12 @@ pub fn trim_whitespace(env: &Env, raw: &Bytes) -> Bytes {
 }
 
 /// Sanitizes a URL by trimming surrounding whitespace and validating its safety.
-pub fn sanitize_url(env: &Env, raw: &Bytes, max_len: u32, allow_http: bool) -> Result<Bytes, Error> {
+pub fn sanitize_url(
+    env: &Env,
+    raw: &Bytes,
+    max_len: u32,
+    allow_http: bool,
+) -> Result<Bytes, Error> {
     let trimmed = trim_whitespace(env, raw);
     validate_external_url(&trimmed, max_len, allow_http)?;
     Ok(trimmed)
@@ -283,7 +298,12 @@ pub fn validate_safe_text(raw: &Bytes, max_len: u32, allow_multiline: bool) -> R
 }
 
 /// Neutralizes and sanitizes untrusted text by stripping unsafe HTML/script tags.
-pub fn sanitize_text(env: &Env, raw: &Bytes, max_len: u32, allow_multiline: bool) -> Result<Bytes, Error> {
+pub fn sanitize_text(
+    env: &Env,
+    raw: &Bytes,
+    max_len: u32,
+    allow_multiline: bool,
+) -> Result<Bytes, Error> {
     let trimmed = trim_whitespace(env, raw);
     validate_safe_text(&trimmed, max_len, allow_multiline)?;
     Ok(trimmed)

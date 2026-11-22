@@ -38,7 +38,7 @@
 //!    - Enforces that rolled-back features cannot be re-enabled until clean rollback verification
 //!      has succeeded ([`rearm_after_verified_rollback`]).
 
-use soroban_sdk::{contracttype, symbol_short, Env, Symbol};
+use soroban_sdk::{contracttype, symbol_short, Address, Env, Symbol};
 
 use crate::feature_flags::{
     emergency_disable, get_flag, FeatureFlag, FeatureFlagError, FULL_ROLLOUT_BPS,
@@ -410,10 +410,12 @@ pub fn init_or_update_guard(
         return Err(FeatureFlagError::InvalidGuardConfig);
     }
 
-    // If currently rolled back and trying to enable, verify that clean rollback verification passed
+    // If currently rolled back, leaving that state needs a clean verification.
+    // Checking only `enabled` let a two-step bypass through (#295): first write
+    // `enabled = false` with a non-RolledBack stage, then enable from there.
     let existing = get_guard_config(env, target);
     if existing.stage == RolloutStage::RolledBack
-        && config.enabled
+        && (config.enabled || config.stage != RolloutStage::RolledBack)
         && !is_rollback_verified(env, target)
     {
         return Err(FeatureFlagError::UnverifiedRollbackReenableForbidden);
@@ -536,8 +538,21 @@ pub fn trigger_auto_rollback(
     reason: RollbackReason,
     failing_error_code: u32,
 ) -> RollbackAuditRecord {
-    // 1. Disable guard and update stage to RolledBack
     let mut config = get_guard_config(env, target);
+
+    // Retried emergency stop (#295): the target is already rolled back, so
+    // re-assert the kill switch but keep the original root cause and any
+    // verification of this same rollback instead of overwriting them.
+    if config.stage == RolloutStage::RolledBack {
+        if let Some(existing) = get_last_rollback_audit(env, target) {
+            if let RolloutTarget::Flag(flag) = target {
+                emergency_disable(env, &flag);
+            }
+            return existing;
+        }
+    }
+
+    // 1. Disable guard and update stage to RolledBack
     config.enabled = false;
     config.rollout_bps = 0;
     config.stage = RolloutStage::RolledBack;
@@ -578,6 +593,28 @@ pub fn trigger_auto_rollback(
     );
 
     audit
+}
+
+/// Authorized emergency disablement (#295): an operator holding
+/// [`Permission::PauseContracts`](crate::auth::Permission::PauseContracts)
+/// (a pauser or the admin) trips a manual rollback of `target`.
+///
+/// Stopping is deliberately cheaper than resuming: any pauser can stop, but
+/// re-enabling still requires a clean [`verify_rollback`] followed by
+/// [`rearm_after_verified_rollback`]. Calling it again while the target is
+/// already rolled back is a safe no-op that returns the original audit record.
+pub fn emergency_stop(
+    env: &Env,
+    target: RolloutTarget,
+    operator: &Address,
+) -> Result<RollbackAuditRecord, crate::errors::Error> {
+    crate::auth::require_permission(env, operator, crate::auth::Permission::PauseContracts)?;
+    let audit = trigger_auto_rollback(env, target, RollbackReason::ManualTrigger, 0);
+    env.events().publish(
+        (symbol_short!("rollout"), symbol_short!("estop")),
+        (target_symbol(target), operator.clone()),
+    );
+    Ok(audit)
 }
 
 // ---------------------------------------------------------------------------
@@ -1136,6 +1173,137 @@ mod tests {
                 assert!(receipt.verified_clean);
                 assert!(is_rollback_verified(&env, target));
             }
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #295: emergency disablement guardrails
+    // -----------------------------------------------------------------------
+
+    fn rolled_back_flag(env: &Env, flag: FeatureFlag) -> RolloutTarget {
+        let target = RolloutTarget::Flag(flag);
+        let mut config = default_guard_config(env);
+        config.enabled = true;
+        config.stage = RolloutStage::Canary;
+        config.rollout_bps = 1_000;
+        init_or_update_guard(env, target, &config).unwrap();
+        trigger_auto_rollback(env, target, RollbackReason::InvariantViolation, 777);
+        target
+    }
+
+    #[test]
+    fn rolled_back_flag_cannot_be_re_enabled_directly() {
+        let env = Env::default();
+        with_storage(&env, || {
+            let flag = FeatureFlag::TreasurySweepV2;
+            let target = rolled_back_flag(&env, flag);
+
+            // Unverified: the direct flag write is refused.
+            assert_eq!(
+                crate::feature_flags::set_flag(&env, &flag, true, FULL_ROLLOUT_BPS),
+                Err(FeatureFlagError::UnverifiedRollbackReenableForbidden)
+            );
+            assert!(!crate::feature_flags::is_enabled(&env, &flag));
+
+            // Verified: still refused, because the guard is still RolledBack;
+            // re-enabling must go through the rearm path.
+            let clean = ModuleConsistencySnapshot::treasury(true, true, true);
+            assert!(verify_rollback(&env, target, &clean).verified_clean);
+            assert_eq!(
+                crate::feature_flags::set_flag(&env, &flag, true, FULL_ROLLOUT_BPS),
+                Err(FeatureFlagError::AlreadyRolledBack)
+            );
+
+            // Disabling is always allowed.
+            assert!(crate::feature_flags::set_flag(&env, &flag, false, 0).is_ok());
+
+            rearm_after_verified_rollback(&env, target, RolloutStage::Canary, 500).unwrap();
+            assert!(crate::feature_flags::is_enabled(&env, &flag));
+            assert!(crate::feature_flags::set_flag(&env, &flag, true, 2_500).is_ok());
+        });
+    }
+
+    #[test]
+    fn two_step_guard_update_cannot_bypass_rollback_verification() {
+        let env = Env::default();
+        with_storage(&env, || {
+            let target = rolled_back_flag(&env, FeatureFlag::ReferralPayoutV2);
+
+            // Step 1 of the old bypass: move off RolledBack while "disabled".
+            let mut sneaky = default_guard_config(&env);
+            sneaky.enabled = false;
+            sneaky.stage = RolloutStage::Canary;
+            assert_eq!(
+                init_or_update_guard(&env, target, &sneaky),
+                Err(FeatureFlagError::UnverifiedRollbackReenableForbidden)
+            );
+            assert_eq!(get_guard_config(&env, target).stage, RolloutStage::RolledBack);
+
+            // Tuning thresholds while staying rolled back is still allowed.
+            let mut tuned = get_guard_config(&env, target);
+            tuned.max_consecutive_failures = 5;
+            assert!(init_or_update_guard(&env, target, &tuned).is_ok());
+            assert_eq!(
+                evaluate_rollout_guard(&env, target, 0),
+                GuardDecision::FallbackLegacy
+            );
+        });
+    }
+
+    #[test]
+    fn repeated_emergency_trigger_keeps_original_root_cause_and_receipt() {
+        let env = Env::default();
+        with_storage(&env, || {
+            let target = rolled_back_flag(&env, FeatureFlag::OracleMedianizerV2);
+            let clean = ModuleConsistencySnapshot::oracle(true, true, true);
+            assert!(verify_rollback(&env, target, &clean).verified_clean);
+
+            // Retry of the emergency stop (e.g. an operator re-running the runbook).
+            let again = trigger_auto_rollback(&env, target, RollbackReason::ManualTrigger, 0);
+            assert_eq!(again.reason, RollbackReason::InvariantViolation);
+            assert_eq!(again.failing_error_code, 777);
+            assert!(is_rollback_verified(&env, target));
+            assert!(!crate::feature_flags::is_enabled(&env, &FeatureFlag::OracleMedianizerV2));
+        });
+    }
+
+    #[test]
+    fn emergency_stop_requires_pause_authority() {
+        use soroban_sdk::testutils::Address as _;
+
+        let env = Env::default();
+        env.mock_all_auths();
+        with_storage(&env, || {
+            let admin = Address::generate(&env);
+            let stranger = Address::generate(&env);
+            crate::auth::set_admin(&env, &admin);
+
+            let target = RolloutTarget::Flag(FeatureFlag::MarketplaceAuctionV2);
+            let mut config = default_guard_config(&env);
+            config.enabled = true;
+            config.stage = RolloutStage::Full;
+            config.rollout_bps = FULL_ROLLOUT_BPS;
+            init_or_update_guard(&env, target, &config).unwrap();
+
+            assert_eq!(
+                emergency_stop(&env, target, &stranger),
+                Err(crate::errors::Error::Unauthorized)
+            );
+            assert_eq!(
+                evaluate_rollout_guard(&env, target, 0),
+                GuardDecision::ProceedNew
+            );
+
+            let audit = emergency_stop(&env, target, &admin).unwrap();
+            assert_eq!(audit.reason, RollbackReason::ManualTrigger);
+            assert_eq!(
+                evaluate_rollout_guard(&env, target, 0),
+                GuardDecision::FallbackLegacy
+            );
+            assert!(!crate::feature_flags::is_enabled(&env, &FeatureFlag::MarketplaceAuctionV2));
+
+            // Idempotent for a retried stop.
+            assert_eq!(emergency_stop(&env, target, &admin).unwrap(), audit);
         });
     }
 }
