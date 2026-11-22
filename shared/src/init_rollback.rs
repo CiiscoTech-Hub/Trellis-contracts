@@ -239,6 +239,21 @@ fn rolled_back_steps(env: &Env, steps: &Vec<InitStep>, up_to: u32) -> Vec<InitSt
     out
 }
 
+fn ran_step_count(steps: &Vec<InitStep>, up_to: u32) -> u32 {
+    let mut count: u32 = 0;
+    let mut i: u32 = 0;
+    for step in steps.iter() {
+        if i <= up_to
+            && (step.outcome == InitStepOutcome::Completed
+                || step.outcome == InitStepOutcome::Failed)
+        {
+            count = count.saturating_add(1);
+        }
+        i = i.saturating_add(1);
+    }
+    count
+}
+
 fn save_tracker(env: &Env, tracker: &InitializationTracker) {
     persistent_set(env, &InitRollbackKey::Tracker(tracker.id.clone()), tracker);
 }
@@ -436,7 +451,12 @@ pub fn complete_rollback(
     if tracker.status != InitializationStatus::AwaitingRollback {
         return Err(Error::InvalidTransition);
     }
-    if verification.id != *id || !verification.fully_rolled_back {
+    let expected_checked = ran_step_count(&tracker.steps, tracker.cursor);
+    if verification.id != *id
+        || !verification.fully_rolled_back
+        || verification.checked != expected_checked
+        || verification.first_not_rolled_back.is_some()
+    {
         return Err(Error::InvalidTransition);
     }
 

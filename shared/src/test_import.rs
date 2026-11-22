@@ -9,9 +9,9 @@ use soroban_sdk::{
 };
 
 use crate::import::{
-    compute_batch_fingerprint, dry_run, execute_import, get_import_counter, get_imported_record,
+    cancel_import, compute_batch_fingerprint, dry_run, execute_import, get_import_counter, get_imported_record,
     has_imported_record, DuplicatePolicy, ImportConfig, ImportError, ImportItem, ImportMode,
-    RollbackStrategy, ABSOLUTE_MAX_IMPORT_SIZE,
+    is_import_cancelled, RollbackStrategy, ABSOLUTE_MAX_IMPORT_SIZE,
 };
 
 #[contract]
@@ -106,6 +106,33 @@ fn dry_run_performs_no_persistent_writes() {
         assert!(!has_imported_record(&ctx.env, &ext_2));
         assert_eq!(get_imported_record(&ctx.env, &ext_1), None);
         assert_eq!(get_imported_record(&ctx.env, &ext_2), None);
+        assert_eq!(get_import_counter(&ctx.env), 0);
+    });
+}
+
+#[test]
+fn cancelled_import_is_rejected_before_commit() {
+    let ctx = setup();
+    ctx.run(|| {
+        let mut items: Vec<ImportItem> = Vec::new(&ctx.env);
+        items.push_back(ImportItem {
+            row_id: 0,
+            external_id: Some(Bytes::from_slice(&ctx.env, b"CANCEL-ME")),
+            recipient: ctx.alice.clone(),
+            amount: 10,
+            expiry: 2_000,
+            metadata_hash: None,
+        });
+        let fingerprint = compute_batch_fingerprint(&ctx.env, &items);
+        cancel_import(&ctx.env, &ctx.admin, &fingerprint).unwrap();
+        assert!(is_import_cancelled(&ctx.env, &fingerprint));
+        let config = ImportConfig {
+            dry_run: false,
+            mode: ImportMode::AllOrNothing,
+            duplicate_policy: DuplicatePolicy::SkipExisting,
+            max_rows: 10,
+        };
+        assert_eq!(execute_import(&ctx.env, &ctx.admin, &items, &config), Err(ImportError::ImportCancelled));
         assert_eq!(get_import_counter(&ctx.env), 0);
     });
 }

@@ -1,6 +1,8 @@
+use shared::events::CORRELATION_ID_MAX_LEN;
 use soroban_sdk::{Bytes, BytesN, Env};
 
 use crate::storage;
+use crate::AidError;
 
 /// Returns a zero-filled correlation ID for use as a default/placeholder.
 pub fn zero_correlation_id(env: &Env) -> BytesN<32> {
@@ -11,12 +13,17 @@ pub fn zero_correlation_id(env: &Env) -> BytesN<32> {
 /// `Option<Bytes>` suitable for event emission and storage.
 ///
 /// When `None` or empty, returns `None` (no correlation). Otherwise the raw
-/// bytes are passed through unchanged — validation is intentionally lenient
-/// here so callers can attach arbitrary opaque context.
-pub fn normalize(_env: &Env, raw: Option<Bytes>) -> Option<Bytes> {
+/// bytes are passed through unchanged, so callers can attach any opaque
+/// context (a UUID, or a raw request hash) up to `CORRELATION_ID_MAX_LEN`.
+///
+/// Fails with [`AidError::InvalidCorrelationId`] when the ID is longer than
+/// `CORRELATION_ID_MAX_LEN` bytes, because it is stored and re-emitted on
+/// every later event for the aid.
+pub fn normalize(_env: &Env, raw: Option<Bytes>) -> Result<Option<Bytes>, AidError> {
     match raw {
-        Some(b) if b.len() > 0 => Some(b),
-        _ => None,
+        Some(b) if b.len() > CORRELATION_ID_MAX_LEN => Err(AidError::InvalidCorrelationId),
+        Some(b) if b.len() > 0 => Ok(Some(b)),
+        _ => Ok(None),
     }
 }
 

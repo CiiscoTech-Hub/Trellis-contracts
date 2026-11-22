@@ -69,7 +69,7 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, vec, Address, Env, IntoVal, Symbol,
+    contract, contractimpl, contracttype, symbol_short, vec, Address, BytesN, Env, IntoVal, Symbol,
 };
 
 use shared::auth::{self, Role};
@@ -118,6 +118,20 @@ const DEFAULT_QUORUM_BPS: u32 = 6_000;
 /// hiding actions behind a large batch.
 pub const MAX_BATCH_ACTIONS: u32 = MAX_BATCH_SIZE;
 
+/// Maximum configurable execution-timelock (grace) delay: 14 days. Bounds how
+/// long a privileged change can be deferred so governance cannot be bricked by
+/// an absurd delay.
+pub const MAX_EXECUTION_DELAY: u64 = 14 * 24 * 60 * 60;
+/// Window after a queued proposal's ETA during which it may still execute.
+/// Past this the proposal is stale and is transitioned to `Expired`. 7 days.
+pub const EXECUTION_GRACE_PERIOD: u64 = 7 * 24 * 60 * 60;
+/// Grace after a proposal's expiry before the pruner may reclaim its storage.
+/// 30 days — long enough for off-chain indexers and audits to capture it.
+pub const PRUNE_RETENTION: u64 = 30 * 24 * 60 * 60;
+/// Default number of proposals [`GovernanceContract::prune_expired`] scans when
+/// the caller passes `0`. Bounds per-call gas.
+pub const DEFAULT_PRUNE_LIMIT: u32 = 32;
+
 type ContractResult<T> = core::result::Result<T, Error>;
 
 // ---------------------------------------------------------------------------
@@ -131,6 +145,10 @@ const KEY_QUORUM_BPS: Symbol = symbol_short!("quorum");
 const KEY_PROP_CNT: Symbol = symbol_short!("prop_cnt");
 const KEY_PROPOSAL: Symbol = symbol_short!("proposal");
 const KEY_APPROVAL: Symbol = symbol_short!("approval");
+/// Execution-timelock delay in seconds (`0` disables it). Issue #542.
+const KEY_EXEC_DELAY: Symbol = symbol_short!("exec_dly");
+/// Per-proposal earliest-execution timestamp; full key is `(KEY_PROP_ETA, id)`.
+const KEY_PROP_ETA: Symbol = symbol_short!("prop_eta");
 
 // ---------------------------------------------------------------------------
 // Types
@@ -213,12 +231,35 @@ pub struct Proposal {
     pub expires_at: u64,
 }
 
+/// Outcome of a bounded [`GovernanceContract::prune_expired`] run (Issue #542).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PruneReport {
+    /// Proposal IDs examined this pass.
+    pub scanned: u32,
+    /// `Pending` proposals transitioned to `Expired` because they passed expiry.
+    pub expired_transitioned: u32,
+    /// Terminal proposals whose storage was reclaimed.
+    pub pruned: u32,
+    /// Next proposal ID to resume from.
+    pub next_cursor: u64,
+    /// `true` when the scan reached the last proposal.
+    pub complete: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Contract
 // ---------------------------------------------------------------------------
 
 #[contract]
 pub struct GovernanceContract;
+
+/// The governance contract does not accept a caller-supplied correlation ID
+/// (proposals are not tied to a request-scoped workflow), so every correlated
+/// event uses the canonical zero correlation ID.
+fn zero_correlation_id(env: &Env) -> BytesN<32> {
+    BytesN::from_array(env, &[0; 32])
+}
 
 #[contractimpl]
 impl GovernanceContract {
@@ -269,6 +310,7 @@ impl GovernanceContract {
         seed_defaults(&env);
         emit_module_initialized(
             &env,
+            &zero_correlation_id(&env),
             symbol_short!("gov"),
             1,
             &admin,
@@ -294,6 +336,7 @@ impl GovernanceContract {
         );
         events::emit_role_granted(
             &env,
+            &zero_correlation_id(&env),
             &caller,
             &user,
             role_name(&role),
@@ -311,6 +354,7 @@ impl GovernanceContract {
         );
         events::emit_role_revoked(
             &env,
+            &zero_correlation_id(&env),
             &caller,
             &user,
             role_name(&role),
@@ -439,6 +483,7 @@ impl GovernanceContract {
 
         events::emit_proposal_created(
             &env,
+            &zero_correlation_id(&env),
             new_id,
             &caller,
             action_symbol(&action),
@@ -487,6 +532,7 @@ impl GovernanceContract {
 
         events::emit_proposal_approved(
             &env,
+            &zero_correlation_id(&env),
             proposal_id,
             &caller,
             proposal.approval_count,
@@ -541,13 +587,45 @@ impl GovernanceContract {
             return Err(Error::BelowThreshold);
         }
 
+        // Execution grace period / timelock (Issue #542). When a non-zero delay
+        // is configured, an approved proposal must first be queued (which stamps
+        // its ETA) and may only execute once the ETA has passed and within the
+        // grace window after it. When the delay is 0 (the default) this block is
+        // skipped entirely, preserving the original immediate-execution flow and
+        // every existing test.
+        let exec_delay = Self::get_execution_delay(env.clone());
+        if exec_delay > 0 {
+            let eta_key = (KEY_PROP_ETA, proposal_id);
+            match instance_get::<_, u64>(&env, &eta_key) {
+                // Not queued: the caller must queue the proposal to start the clock.
+                None => return Err(Error::ActionTooEarly),
+                Some(eta) => {
+                    let now = env.ledger().timestamp();
+                    if now < eta {
+                        return Err(Error::ActionTooEarly);
+                    }
+                    if now > eta.saturating_add(EXECUTION_GRACE_PERIOD) {
+                        // Grace window elapsed: the queued proposal is stale.
+                        proposal.status = ProposalStatus::Expired;
+                        instance_set(&env, &proposal_key, &proposal);
+                        env.events()
+                            .publish((shared::events::PROPOSAL_EXPIRED,), (proposal_id, now));
+                        return Err(Error::ProposalExpired);
+                    }
+                }
+            }
+        }
+
         execute_action(&env, &proposal.action)?;
 
         proposal.status = ProposalStatus::Executed;
         instance_set(&env, &proposal_key, &proposal);
+        // Reclaim the timelock entry now that the proposal is terminal.
+        shared::storage::instance_remove(&env, &(KEY_PROP_ETA, proposal_id));
 
         events::emit_proposal_executed(
             &env,
+            &zero_correlation_id(&env),
             proposal_id,
             &caller,
             proposal.approval_count,
@@ -596,6 +674,156 @@ impl GovernanceContract {
     }
 
     // -----------------------------------------------------------------------
+    // Execution grace period & proposal pruning (Issue #542)
+    // -----------------------------------------------------------------------
+
+    /// Set the execution-timelock (grace) delay in seconds. `0` disables the
+    /// timelock and restores immediate execution once approvals are met (the
+    /// default behavior). Bounded by [`MAX_EXECUTION_DELAY`]. Active admin only.
+    ///
+    /// When enabled, an approved proposal must be [`GovernanceContract::queue`]d
+    /// and can only [`GovernanceContract::execute`] after `delay` seconds have
+    /// elapsed and within [`EXECUTION_GRACE_PERIOD`] of its ETA — a window for
+    /// stakeholders to react to, or veto (via `cancel`), a pending change.
+    pub fn set_execution_delay(env: Env, caller: Address, delay_secs: u64) -> Result<(), Error> {
+        require_active_admin(&env, &caller)?;
+        if delay_secs > MAX_EXECUTION_DELAY {
+            return Err(Error::ConfigInvalid);
+        }
+        instance_set(&env, &KEY_EXEC_DELAY, &delay_secs);
+        Ok(())
+    }
+
+    /// Current execution-timelock delay in seconds (`0` = disabled).
+    pub fn get_execution_delay(env: Env) -> u64 {
+        instance_get(&env, &KEY_EXEC_DELAY).unwrap_or(0)
+    }
+
+    /// The earliest-execution timestamp (ETA) of a queued proposal, if queued.
+    pub fn get_proposal_eta(env: Env, proposal_id: u64) -> Option<u64> {
+        instance_get(&env, &(KEY_PROP_ETA, proposal_id))
+    }
+
+    /// Queue an approved proposal, starting its execution timelock. Active admin
+    /// only. The proposal must be `Pending`, within its expiry, and already meet
+    /// the live required-approval count. Sets `eta = now + delay` and returns it.
+    ///
+    /// Re-queuing an already-queued proposal is rejected with
+    /// [`Error::InvalidArgument`] so the timelock cannot be reset to buy time.
+    pub fn queue(env: Env, caller: Address, proposal_id: u64) -> Result<u64, Error> {
+        require_active_admin(&env, &caller)?;
+
+        let proposal_key = (KEY_PROPOSAL, proposal_id);
+        let mut proposal: Proposal =
+            instance_get(&env, &proposal_key).ok_or(Error::ProposalNotFound)?;
+        if proposal.status != ProposalStatus::Pending {
+            return Err(Error::AlreadyExecuted);
+        }
+        let now = env.ledger().timestamp();
+        if now > proposal.expires_at {
+            proposal.status = ProposalStatus::Expired;
+            instance_set(&env, &proposal_key, &proposal);
+            env.events()
+                .publish((shared::events::PROPOSAL_EXPIRED,), (proposal_id, now));
+            return Err(Error::ProposalExpired);
+        }
+
+        let eta_key = (KEY_PROP_ETA, proposal_id);
+        if instance_get::<_, u64>(&env, &eta_key).is_some() {
+            return Err(Error::InvalidArgument); // already queued
+        }
+
+        // Approvals must meet the live requirement (recomputed, like `execute`).
+        let threshold: u32 = instance_get(&env, &KEY_THRESHOLD).unwrap_or(0);
+        let active_admins = Self::get_admin_set(env.clone());
+        let active_count = instance_get(&env, &KEY_ADMIN_COUNT).unwrap_or(active_admins.len());
+        let quorum_bps = Self::get_quorum_bps(env.clone());
+        let required = required_approvals(active_count, threshold, quorum_bps);
+        let valid_approvals = count_active_approvals(&env, proposal_id, &active_admins);
+        if valid_approvals < required {
+            return Err(Error::BelowThreshold);
+        }
+
+        let delay = Self::get_execution_delay(env.clone());
+        let eta = now.saturating_add(delay);
+        instance_set(&env, &eta_key, &eta);
+        env.events()
+            .publish((symbol_short!("prop"), symbol_short!("queued")), (proposal_id, eta));
+        Ok(eta)
+    }
+
+    /// Prune expired / terminal proposals to reclaim storage, bounded and
+    /// resumable. Active admin only.
+    ///
+    /// Starting at `start_id` (clamped to the first proposal), up to `limit`
+    /// proposals are examined (`0` selects [`DEFAULT_PRUNE_LIMIT`]):
+    /// - A `Pending` proposal past its expiry is transitioned to `Expired`
+    ///   and a `PROPOSAL_EXPIRED` event is emitted.
+    /// - A terminal proposal (`Executed`/`Cancelled`/`Expired`) whose expiry is
+    ///   older than [`PRUNE_RETENTION`] has its record, timelock entry, and the
+    ///   approval flags of the current admin set removed. Its history remains on
+    ///   the event log; `get_proposal` returns `ProposalNotFound` afterwards.
+    ///
+    /// Idempotent: re-running over an already-pruned range reclaims nothing.
+    /// Resume with the returned `next_cursor` until `complete` is `true`.
+    pub fn prune_expired(
+        env: Env,
+        caller: Address,
+        start_id: u64,
+        limit: u32,
+    ) -> Result<PruneReport, Error> {
+        require_active_admin(&env, &caller)?;
+        let total: u64 = instance_get(&env, &KEY_PROP_CNT).unwrap_or(0);
+        let now = env.ledger().timestamp();
+        let budget = if limit == 0 { DEFAULT_PRUNE_LIMIT } else { limit };
+
+        let mut scanned = 0u32;
+        let mut expired_transitioned = 0u32;
+        let mut pruned = 0u32;
+        let mut id = start_id.max(1);
+        while id <= total && scanned < budget {
+            let proposal_key = (KEY_PROPOSAL, id);
+            if let Some(mut proposal) = instance_get::<_, Proposal>(&env, &proposal_key) {
+                if proposal.status == ProposalStatus::Pending && now > proposal.expires_at {
+                    proposal.status = ProposalStatus::Expired;
+                    instance_set(&env, &proposal_key, &proposal);
+                    env.events()
+                        .publish((shared::events::PROPOSAL_EXPIRED,), (id, now));
+                    expired_transitioned += 1;
+                }
+                let terminal = matches!(
+                    proposal.status,
+                    ProposalStatus::Executed | ProposalStatus::Cancelled | ProposalStatus::Expired
+                );
+                if terminal && now > proposal.expires_at.saturating_add(PRUNE_RETENTION) {
+                    shared::storage::instance_remove(&env, &proposal_key);
+                    shared::storage::instance_remove(&env, &(KEY_PROP_ETA, id));
+                    let admins = Self::get_admin_set(env.clone());
+                    let mut i = 0;
+                    while i < admins.len() {
+                        let a = admins.get(i).unwrap();
+                        shared::storage::instance_remove(&env, &(KEY_APPROVAL, id, a));
+                        i += 1;
+                    }
+                    pruned += 1;
+                    env.events()
+                        .publish((symbol_short!("prop"), symbol_short!("pruned")), (id, now));
+                }
+            }
+            scanned += 1;
+            id += 1;
+        }
+
+        Ok(PruneReport {
+            scanned,
+            expired_transitioned,
+            pruned,
+            next_cursor: id,
+            complete: id > total,
+        })
+    }
+
+    // -----------------------------------------------------------------------
     // Parameter management
     // -----------------------------------------------------------------------
 
@@ -615,6 +843,7 @@ impl GovernanceContract {
         );
         emit_action_executed(
             &env,
+            &zero_correlation_id(&env),
             symbol_short!("gov"),
             symbol_short!("set_param"),
             &caller,
@@ -838,6 +1067,7 @@ fn role_name(role: &Role) -> Symbol {
         Role::OracleSigner => symbol_short!("oracle_s"),
         Role::EndUser => symbol_short!("end_user"),
         Role::ServiceActor => symbol_short!("svc_actor"),
+        Role::Support => symbol_short!("support"),
     }
 }
 
@@ -2093,5 +2323,180 @@ mod tests {
             Err(Ok(Error::Unauthorized))
         );
         assert_eq!(client.aid_default_expiry(), DEFAULT_AID_DEFAULT_EXPIRY);
+    }
+
+    // -----------------------------------------------------------------------
+    // Execution grace period & proposal pruning (Issue #542)
+    // -----------------------------------------------------------------------
+
+    /// Drive a proposal to the approval threshold (2-of-2) and return its id.
+    fn approved_pause_proposal(
+        env: &Env,
+        client: &GovernanceContractClient<'static>,
+        admin: &Address,
+    ) -> u64 {
+        let second = client.get_admin_set().get(1).unwrap();
+        let _ = env;
+        let id = client.propose(admin, &ProposalAction::Pause);
+        client.approve(admin, &id);
+        client.approve(&second, &id);
+        id
+    }
+
+    #[test]
+    fn timelock_disabled_by_default_executes_immediately() {
+        let (env, client, admin) = setup();
+        env.ledger().set_timestamp(1_000_000);
+        assert_eq!(client.get_execution_delay(), 0);
+        let id = approved_pause_proposal(&env, &client, &admin);
+        // No queue needed when the timelock is off (preserves prior behavior).
+        client.execute(&admin, &id);
+        assert_eq!(client.get_proposal(&id).status, ProposalStatus::Executed);
+    }
+
+    #[test]
+    fn timelock_requires_queue_then_elapsed_delay() {
+        let (env, client, admin) = setup();
+        env.ledger().set_timestamp(1_000_000);
+        client.set_execution_delay(&admin, &1_000);
+        let id = approved_pause_proposal(&env, &client, &admin);
+
+        // Not queued yet: execution is refused.
+        assert_eq!(
+            client.try_execute(&admin, &id),
+            Err(Ok(Error::ActionTooEarly))
+        );
+
+        let eta = client.queue(&admin, &id);
+        assert_eq!(eta, 1_001_000);
+        assert_eq!(client.get_proposal_eta(&id), Some(1_001_000));
+
+        // Before the ETA: still refused.
+        env.ledger().set_timestamp(1_000_500);
+        assert_eq!(
+            client.try_execute(&admin, &id),
+            Err(Ok(Error::ActionTooEarly))
+        );
+
+        // After the ETA, within the grace window: succeeds.
+        env.ledger().set_timestamp(1_002_000);
+        client.execute(&admin, &id);
+        assert_eq!(client.get_proposal(&id).status, ProposalStatus::Executed);
+        // The timelock entry is reclaimed on execution.
+        assert_eq!(client.get_proposal_eta(&id), None);
+    }
+
+    #[test]
+    fn queue_rejects_below_threshold() {
+        let (env, client, admin) = setup();
+        env.ledger().set_timestamp(1_000_000);
+        client.set_execution_delay(&admin, &1_000);
+        let id = client.propose(&admin, &ProposalAction::Pause);
+        client.approve(&admin, &id); // only 1 of 2
+        assert_eq!(
+            client.try_queue(&admin, &id),
+            Err(Ok(Error::BelowThreshold))
+        );
+    }
+
+    #[test]
+    fn queue_cannot_be_reset() {
+        let (env, client, admin) = setup();
+        env.ledger().set_timestamp(1_000_000);
+        client.set_execution_delay(&admin, &1_000);
+        let id = approved_pause_proposal(&env, &client, &admin);
+        client.queue(&admin, &id);
+        assert_eq!(
+            client.try_queue(&admin, &id),
+            Err(Ok(Error::InvalidArgument))
+        );
+    }
+
+    #[test]
+    fn timelock_grace_window_expiry() {
+        let (env, client, admin) = setup();
+        env.ledger().set_timestamp(1_000_000);
+        client.set_execution_delay(&admin, &100);
+        let id = approved_pause_proposal(&env, &client, &admin);
+        client.queue(&admin, &id); // eta = 1_000_100
+
+        // Past eta + grace, but still before the 30-day proposal expiry.
+        env.ledger()
+            .set_timestamp(1_000_100 + EXECUTION_GRACE_PERIOD + 1);
+        assert_eq!(
+            client.try_execute(&admin, &id),
+            Err(Ok(Error::ProposalExpired))
+        );
+        assert_eq!(client.get_proposal(&id).status, ProposalStatus::Expired);
+    }
+
+    #[test]
+    fn set_execution_delay_bounds_and_auth() {
+        let (env, client, admin) = setup();
+        assert_eq!(
+            client.try_set_execution_delay(&admin, &(MAX_EXECUTION_DELAY + 1)),
+            Err(Ok(Error::ConfigInvalid))
+        );
+        let stranger = Address::generate(&env);
+        assert!(client
+            .try_set_execution_delay(&stranger, &1_000)
+            .is_err());
+    }
+
+    #[test]
+    fn prune_transitions_pending_past_expiry() {
+        let (env, client, admin) = setup();
+        env.ledger().set_timestamp(1_000_000);
+        let id = client.propose(&admin, &ProposalAction::Pause);
+
+        // Past the proposal's expiry but within the prune-retention window.
+        env.ledger().set_timestamp(1_000_000 + PROPOSAL_LIFETIME + 1);
+        let report = client.prune_expired(&admin, &0, &0);
+        assert_eq!(report.expired_transitioned, 1);
+        assert_eq!(report.pruned, 0);
+        // Still present, now marked Expired.
+        assert_eq!(client.get_proposal(&id).status, ProposalStatus::Expired);
+    }
+
+    #[test]
+    fn prune_reclaims_terminal_after_retention() {
+        let (env, client, admin) = setup();
+        env.ledger().set_timestamp(1_000_000);
+        let id = approved_pause_proposal(&env, &client, &admin);
+        client.execute(&admin, &id); // Executed (timelock disabled)
+
+        env.ledger()
+            .set_timestamp(1_000_000 + PROPOSAL_LIFETIME + PRUNE_RETENTION + 1);
+        let report = client.prune_expired(&admin, &0, &0);
+        assert_eq!(report.pruned, 1);
+        // Record reclaimed: get_proposal now reports it missing.
+        assert_eq!(
+            client.try_get_proposal(&id),
+            Err(Ok(Error::ProposalNotFound))
+        );
+    }
+
+    #[test]
+    fn prune_requires_admin() {
+        let (env, client, _admin) = setup();
+        let stranger = Address::generate(&env);
+        assert!(client.try_prune_expired(&stranger, &0, &0).is_err());
+    }
+
+    #[test]
+    fn prune_is_bounded_and_resumable() {
+        let (env, client, admin) = setup();
+        env.ledger().set_timestamp(1_000_000);
+        for _ in 0..3 {
+            client.propose(&admin, &ProposalAction::Pause);
+        }
+        // Scan one proposal per call.
+        let first = client.prune_expired(&admin, &1, &1);
+        assert_eq!(first.scanned, 1);
+        assert!(!first.complete);
+        assert_eq!(first.next_cursor, 2);
+        let second = client.prune_expired(&admin, &first.next_cursor, &1);
+        assert_eq!(second.scanned, 1);
+        assert_eq!(second.next_cursor, 3);
     }
 }

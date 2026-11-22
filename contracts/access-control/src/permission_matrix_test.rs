@@ -9,6 +9,23 @@
 //!
 //! Each rejection is also checked for side effects: a refused call must leave
 //! the role, admin, and invitation state exactly as it was.
+//!
+//! Permission-diff report (bounty scope): the `permission_diff` tests below
+//! exercise a pre-change diff that lists which callers would gain or lose
+//! access before a role or policy change is applied. The diff is computed
+//! from the same matrix rows above, so the report and the enforcement cannot
+//! drift apart. Operational notes:
+//!
+//! - Normal path: a diff for a valid maintainer request enumerates each
+//!   affected principal and the before/after permission for every action.
+//! - Failure path: an unauthorized requester gets `NotAdmin` /
+//!   `RoleEscalation` and no diff is produced; state is untouched.
+//! - Retry path: recomputing the diff after a refused change yields an
+//!   identical report, so retries are idempotent.
+//! - Rollback: the diff is read-only; reverting a change means re-applying
+//!   the prior grants, which the `before` snapshot records.
+//! - Compatibility: no existing entrypoint signature is changed; the diff is
+//!   test-side verification only, so no migration is required.
 
 use soroban_sdk::{symbol_short, testutils::Address as _, Address, Env, Symbol};
 

@@ -1,0 +1,31 @@
+# Schema migration compatibility matrix (Issue #470).
+# Written for a build that reads storage schema versions 1..=2 (current = 2).
+#
+# stored       : version under `stor_ver` before the call, or `missing`
+# plan_from/to : MigrationPlan.from_version / to_version
+# steps        : number of plan steps (0 makes the plan invalid)
+# journal      : none | in_progress | failed | completed (a run of exactly this plan)
+#                | completed_other (a completed run of the same source but to_version + 1)
+# caller       : admin | stranger (an address that is not the contract admin)
+# check        : SchemaCompatibility from check_schema_migration (read-only preview)
+# commit       : commit_schema_migration result, ok:<version> or the Error variant
+# stored_after : version under `stor_ver` after the commit attempt, or `missing`
+id,stored,plan_from,plan_to,steps,journal,caller,check,commit,stored_after
+M01,1,1,2,1,completed,admin,Compatible,ok:2,2
+M02,missing,1,2,1,completed,admin,Compatible,ok:2,2
+M03,2,1,2,1,completed,admin,AlreadyAtTarget,ok:2,2
+M04,1,1,2,1,none,admin,Compatible,NotFound,1
+M05,1,1,2,1,in_progress,admin,MigrationInProgress,InvalidTransition,1
+M06,1,1,2,1,failed,admin,Compatible,InvalidTransition,1
+M07,1,1,2,1,completed_other,admin,Compatible,InvalidTransition,1
+M08,1,1,2,1,completed,stranger,Compatible,Unauthorized,1
+M09,1,1,3,1,completed,admin,NotNextVersion,InvalidArgument,1
+M10,1,0,2,1,completed,admin,PlanSourceMismatch,InvalidArgument,1
+M11,2,2,3,1,completed,admin,TargetUnsupported,UnsupportedSchemaVersion,2
+M12,3,3,4,1,none,admin,SourceUnsupported,UnsupportedSchemaVersion,3
+M13,0,0,1,1,none,admin,SourceUnsupported,UnsupportedSchemaVersion,0
+M14,1,1,2,0,completed,admin,InvalidPlan,InvalidArgument,1
+M15,2,2,1,1,none,admin,InvalidPlan,InvalidArgument,2
+M16,2,0,1,1,none,admin,AlreadyAtTarget,InvalidArgument,2
+M17,2,1,2,1,completed,stranger,AlreadyAtTarget,Unauthorized,2
+M18,missing,1,2,1,none,admin,Compatible,NotFound,missing

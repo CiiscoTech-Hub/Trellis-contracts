@@ -329,3 +329,55 @@ impl TelemetryTimer {
         self.finish(env, TelemetryResult::Failure);
     }
 }
+
+/// Storage key for the cross-contract call-depth counter.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CallDepthKey {
+    Depth,
+}
+
+/// Maximum permitted cross-contract call depth before the guard trips.
+pub const MAX_CALL_DEPTH: u32 = 8;
+
+/// Error returned when a reentrancy or depth limit is exceeded.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GuardError {
+    DepthExceeded,
+}
+
+/// Current recorded call depth (0 when unset).
+pub fn current_call_depth(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&CallDepthKey::Depth)
+        .unwrap_or(0)
+}
+
+/// Enter a guarded section, incrementing depth and publishing telemetry.
+///
+/// Fails with `GuardError::DepthExceeded` (no state change) when the limit
+/// would be exceeded. Callers must pair every successful `enter` with `exit`,
+/// including on failure paths, so depth is never leaked.
+pub fn enter_guarded(env: &Env, operation: Symbol, actor: ActorType) -> Result<u32, GuardError> {
+    let depth = current_call_depth(env);
+    if depth >= MAX_CALL_DEPTH {
+        emit_failure(env, operation, actor, 0);
+        return Err(GuardError::DepthExceeded);
+    }
+    let next = depth + 1;
+    env.storage().instance().set(&CallDepthKey::Depth, &next);
+    emit_success(env, operation, actor, 0);
+    Ok(next)
+}
+
+/// Leave a guarded section, decrementing depth (saturating at zero).
+///
+/// Recovery: safe to call on error paths; an unmatched exit cannot underflow.
+pub fn exit_guarded(env: &Env) {
+    let depth = current_call_depth(env);
+    env.storage()
+        .instance()
+        .set(&CallDepthKey::Depth, &depth.saturating_sub(1));
+}
+}

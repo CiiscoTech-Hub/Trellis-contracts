@@ -248,6 +248,7 @@ contracts/
 
 shared/                    # Types, errors, events, auth, math, storage utils
 testing/                   # Mocks, helpers, simulation, fuzzing harnesses
+ops-checks/                # Synthetic journey monitor + executable incident runbook checks
 tests/                     # Workspace-level integration tests
 scripts/                   # Deploy, upgrade, initialise, verify
 ```

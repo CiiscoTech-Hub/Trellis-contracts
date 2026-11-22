@@ -65,9 +65,44 @@ canonical client mapping ranges are:
 | `Payments` | `700-711` | `shared::errors::Error` |
 | `Batch` | `800-805` | `shared::batch::BatchError` |
 | `Upgradeability` | `900-915` | `contracts/upgradeability::UpgradeError` |
+| `Jobs` | `1-9` | `shared::jobs::JobError` |
 | `Import` | `940-949` | `shared::import::ImportError` |
 | `Export` | `920-934` | `shared::export::ExportError` |
+| `SupportAccess` | `960-973` | `shared::impersonation::ImpersonationError` |
+| `FeatureFlags` | `960-968` | `shared::feature_flags::FeatureFlagError` |
 | `Marketplace` | `2000-2023` | `contracts/nft-marketplace::MarketError` |
+
+### Feature-flag and rollout-guard codes (`FeatureFlags`)
+
+`FeatureFlagError` reuses the 960s, like `SupportAccess` (and
+`shared::backfill`). Before the `FeatureFlags` domain existed, a client
+rendering `961` (`Disabled`) under `SupportAccess` would have shown
+`SUPPORT_ACCESS_UNAUTHORIZED`. Always pass `ErrorDomain::FeatureFlags` for
+these errors.
+
+| Raw | Variant | Stable code | Category | Retryable | Remediation |
+|---:|---|---|---|:---:|---|
+| 960 | `InvalidRollout` | `FEATURE_ROLLOUT_INVALID` | Validation | no | Use a rollout weight between 0 and 10000 bps. |
+| 961 | `Disabled` | `FEATURE_DISABLED` | Configuration | no | Use the existing (legacy) flow; the feature is off or not rolled out. |
+| 962 | `GuardBlocked` | `FEATURE_GUARD_BLOCKED` | Configuration | yes | Use the legacy flow; retry once the guard reports healthy. |
+| 963 | `AutomaticRollbackTriggered` | `FEATURE_ROLLED_BACK` | Configuration | no | Use the legacy flow. Operators run `verify_rollback` before re-arming. |
+| 964 | `RollbackVerificationFailed` | `ROLLBACK_VERIFICATION_FAILED` | Internal | no | Keep the feature disabled; repair the reported anomaly, verify again. |
+| 965 | `InconsistentStateDetected` | `ROLLBACK_STATE_INCONSISTENT` | Internal | no | Keep disabled; reconcile the affected records, then verify again. |
+| 966 | `AlreadyRolledBack` | `FEATURE_ALREADY_ROLLED_BACK` | Conflict | no | Re-enable only through `rearm_after_verified_rollback`. |
+| 967 | `InvalidGuardConfig` | `ROLLOUT_GUARD_CONFIG_INVALID` | Validation | no | `max_consecutive_failures > 0` and `max_error_rate_bps <= 10000`. |
+| 968 | `UnverifiedRollbackReenableForbidden` | `ROLLBACK_NOT_VERIFIED` | Conflict | no | Run `verify_rollback` with a clean snapshot, then rearm. |
+
+Only `GuardBlocked` is retryable: the guard routes the caller back to the new
+path once health recovers. Every other rollout rejection needs an operator
+action (verification, rearm, or a config fix), so resubmitting the same request
+cannot succeed. The `feature_flag_errors_have_stable_codes_and_remediation` test
+pins each variant's number, stable code, category and retry policy, so a
+renumbering or a changed string fails CI.
+
+**Migration:** `ErrorDomain::FeatureFlags` is appended after the existing
+variants, so the encoding of existing domains is unchanged. Clients that never
+pass the new domain behave exactly as before. To roll back, remove the
+variant and its mapping; no on-chain state references it.
 
 Not every number inside a range is assigned. Additive changes require a new
 unused raw code, a `describe_error` mapping with conservative retryability, and

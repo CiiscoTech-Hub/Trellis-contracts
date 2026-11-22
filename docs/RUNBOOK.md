@@ -430,8 +430,9 @@ identity.
 
 Run the incident drill before a release and after changing recovery or rollback
 procedures. It exercises import validation and rollback, deterministic recovery,
-release readiness, and the partial-failure dashboard used to report user
-impact. The drill uses local test fixtures only; it does not connect to an RPC
+release readiness, the partial-failure dashboard used to report user
+impact, the high-value journey monitor, and the executable recovery checks
+for escrow incidents ([`INCIDENT_RUNBOOK.md`](./INCIDENT_RUNBOOK.md)). The drill uses local test fixtures only; it does not connect to an RPC
 endpoint or submit transactions.
 
 ```bash

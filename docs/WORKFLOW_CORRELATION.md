@@ -59,6 +59,65 @@ to the workflow's original ID, and retry that step. No rollback is required.
 
 ## Compatibility
 
-This is an additive shared helper. Existing per-record correlation in
-`contracts/aid-contract/src/correlation.rs` is unchanged and keeps its lenient
-behavior.
+This is an additive shared helper. The aid contract's per-record correlation
+ID follows its own, looser rule, described below.
+
+## Aid contract request correlation (Issue #476)
+
+`create_aid` accepts an optional `correlation_id: Option<Bytes>`. The contract
+stores it with the aid and re-emits it on every later event for that aid, so
+one ID joins the whole request from creation to settlement or refund.
+
+| Step | Event (legacy topic) | Correlation ID in the data |
+|---|---|---|
+| `create_aid` | `aid_crt` | as supplied |
+| `claim_aid` | `aid_clm`, `aid_stl` | loaded from storage |
+| `refund_aid` | `aid_ref` | loaded from storage |
+
+Claim and refund take no correlation argument, so a later caller cannot
+relabel an aid's events.
+
+### Policy
+
+| Input | Result |
+|---|---|
+| `None` or empty bytes | Accepted; the aid has no correlation ID and events carry `None` |
+| 1 to 64 bytes (`CORRELATION_ID_MAX_LEN`) | Accepted as-is; any byte values, so a UUID or a raw 32-byte request hash both fit |
+| More than 64 bytes | Rejected with `AidError::InvalidCorrelationId` (code 108) |
+
+### Normal, failure, retry, and authorization paths
+
+- **Normal.** The ID given to `create_aid` appears on `aid_crt`, then on
+  `aid_clm` and `aid_stl` when the recipient claims, or on `aid_ref` when the
+  donor or admin refunds.
+- **Failure.** An oversized ID fails the whole `create_aid` call before any
+  write: no aid is stored, the aid counter does not move, and no funds leave
+  the donor.
+- **Retry.** A claim or refund that fails (paused contract, wrong caller, not
+  yet expired) changes nothing, so the stored ID is still there and the retry
+  emits it unchanged. Retrying `create_aid` itself is different: each call
+  creates a new aid, and both carry the same ID. Before retrying a create
+  whose outcome is unknown, look for an `aid_crt` event with that ID.
+- **Authorization.** The ID is a label, not a credential. A stranger's claim
+  or refund fails with `Unauthorized` and leaves the stored ID untouched.
+
+### Edge cases
+
+- `batch_create_aid` and `create_milestone_aid` take no correlation ID; their
+  aids emit `None`.
+- The structured `("aid", "created")` and `("logging", "action")` events
+  still carry the all-zero 32-byte ID; use the legacy topics above to join a
+  request.
+
+### Recovery and rollback
+
+A rejected `create_aid` leaves no state, so the client shortens the ID (a
+UUID is 36 bytes, a hex SHA-256 is 64) and calls again. Nothing needs to be
+rolled back.
+
+### Migration
+
+Callers that send IDs of 64 bytes or less see no change. Callers that sent
+longer IDs now get error 108 and must shorten them. IDs already stored are
+never re-checked, so existing aids keep emitting their original ID on claim
+or refund.
