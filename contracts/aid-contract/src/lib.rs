@@ -1452,15 +1452,30 @@ fn contains_id(ids: &Vec<u64>, wanted: u64) -> bool {
     false
 }
 
+/// Add `aid_id` to the derived discovery index, keeping it sorted ascending.
+///
+/// The keyset cursor (`search_aids_cursor` → `shared::paginate_id_list`)
+/// binary-searches this index, so it must stay sorted. Appending would break
+/// that whenever an older record re-enters the index: an admin un-hiding a
+/// record via `set_aid_search_visibility` pushed it behind newer IDs, so
+/// cursor pages skipped it (Issue #480).
 fn index_aid(env: &Env, aid_id: u64) {
     if storage::is_search_hidden(env, aid_id) {
         return;
     }
     let mut ids = storage::get_search_index(env);
-    if !contains_id(&ids, aid_id) {
-        ids.push_back(aid_id);
-        storage::set_search_index(env, &ids);
+    let mut position = ids.len();
+    for (i, id) in ids.iter().enumerate() {
+        if id == aid_id {
+            return;
+        }
+        if id > aid_id {
+            position = i as u32;
+            break;
+        }
     }
+    ids.insert(position, aid_id);
+    storage::set_search_index(env, &ids);
 }
 
 fn index_aids(env: &Env, new_ids: &Vec<u64>) {
@@ -1525,3 +1540,7 @@ mod profile_budget;
 
 #[cfg(test)]
 mod aid_export_test;
+
+/// Authorization tests for hidden and archived records (Issue #480).
+#[cfg(test)]
+mod hidden_archived_auth_test;

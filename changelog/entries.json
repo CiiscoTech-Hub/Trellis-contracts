@@ -421,5 +421,41 @@
     "migration_notes": "",
     "issue": 546,
     "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-11-24",
+    "impact": "compatible",
+    "summary": "Added oracle price feed heartbeat validation and L2 deviation quarantine with auto-recovery and admin override controls in shared::oracle_quarantine (#518).",
+    "migration_notes": "",
+    "issue": 518,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-11-24",
+    "impact": "compatible",
+    "summary": "Created multi-asset treasury reserve floor and auto-pause guard preventing reserve exhaustion and locking outflows on breach in shared::treasury_floor (#520).",
+    "migration_notes": "",
+    "issue": 520,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-11-24",
+    "impact": "compatible",
+    "summary": "Implemented governance proposal timelock cancellation and collective admin veto quorum in shared::governance_timelock (#521).",
+    "migration_notes": "",
+    "issue": 521,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-11-24",
+    "impact": "compatible",
+    "summary": "Added NFT royalty split invariant enforcement across secondary sales guaranteeing exact token conservation and multi-recipient shares in shared::nft_royalty (#522).",
+    "migration_notes": "",
+    "issue": 522,
+    "pr": null
   }
 ]
