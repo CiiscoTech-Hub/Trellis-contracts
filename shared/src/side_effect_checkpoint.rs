@@ -577,4 +577,169 @@ mod tests {
             );
         });
     }
+
+    fn begin_execute(
+        env: &Env,
+        actor: &Address,
+        target: &Address,
+        payload_hash: &BytesN<32>,
+    ) -> SideEffectCheckpoint {
+        match begin_side_effect(
+            env,
+            actor,
+            symbol_short!("edge"),
+            0,
+            SideEffectKind::SettlementPayout,
+            target,
+            payload_hash.clone(),
+        )
+        .unwrap()
+        {
+            BeginEffectOutcome::Execute(cp) => cp,
+            _ => panic!("expected Execute"),
+        }
+    }
+
+    #[test]
+    fn test_rollback_after_commit_is_rejected_and_commit_is_preserved() {
+        let (env, contract_id, admin, actor, target) = setup();
+        let payload_hash: BytesN<32> = env.crypto().sha256(&Bytes::from_slice(&env, b"p")).into();
+
+        env.as_contract(&contract_id, || {
+            let cp = begin_execute(&env, &actor, &target, &payload_hash);
+            commit_side_effect(&env, &actor, &cp.effect_id).unwrap();
+
+            assert_eq!(
+                rollback_side_effect(&env, &admin, &cp.effect_id, symbol_short!("late")),
+                Err(Error::AlreadyExecuted)
+            );
+            // A late failure report must not downgrade a committed effect either.
+            assert_eq!(
+                fail_side_effect(&env, &actor, &cp.effect_id, 500),
+                Err(Error::AlreadyExecuted)
+            );
+            let stored = get_side_effect_checkpoint(&env, &cp.effect_id).unwrap();
+            assert_eq!(stored.state, SideEffectState::Committed);
+            assert_eq!(stored.last_error, 0);
+        });
+    }
+
+    #[test]
+    fn test_rolled_back_effect_is_terminal_and_rollback_is_idempotent() {
+        let (env, contract_id, admin, actor, target) = setup();
+        let payload_hash: BytesN<32> = env.crypto().sha256(&Bytes::from_slice(&env, b"p")).into();
+
+        env.as_contract(&contract_id, || {
+            let cp = begin_execute(&env, &actor, &target, &payload_hash);
+            let failed = fail_side_effect(&env, &actor, &cp.effect_id, 7).unwrap();
+            let rolled =
+                rollback_side_effect(&env, &admin, &cp.effect_id, symbol_short!("abort")).unwrap();
+            assert_eq!(rolled.state, SideEffectState::RolledBack);
+            // Rollback keeps the recorded failure for audit.
+            assert_eq!(rolled.last_error, failed.last_error);
+
+            assert_eq!(
+                rollback_side_effect(&env, &admin, &cp.effect_id, symbol_short!("again")),
+                Ok(rolled)
+            );
+            assert_eq!(
+                commit_side_effect(&env, &actor, &cp.effect_id),
+                Err(Error::AlreadyExecuted)
+            );
+            assert_eq!(
+                fail_side_effect(&env, &actor, &cp.effect_id, 9),
+                Err(Error::AlreadyExecuted)
+            );
+        });
+    }
+
+    #[test]
+    fn test_begin_by_other_actor_is_unauthorized_and_leaves_checkpoint_unchanged() {
+        let (env, contract_id, _admin, actor, target) = setup();
+        let other = Address::generate(&env);
+        let payload_hash: BytesN<32> = env.crypto().sha256(&Bytes::from_slice(&env, b"p")).into();
+
+        env.as_contract(&contract_id, || {
+            let cp = begin_execute(&env, &actor, &target, &payload_hash);
+
+            assert_eq!(
+                begin_side_effect(
+                    &env,
+                    &other,
+                    symbol_short!("edge"),
+                    0,
+                    SideEffectKind::SettlementPayout,
+                    &target,
+                    payload_hash.clone(),
+                ),
+                Err(Error::Unauthorized)
+            );
+            assert_eq!(
+                fail_side_effect(&env, &other, &cp.effect_id, 1),
+                Err(Error::Unauthorized)
+            );
+            assert_eq!(get_side_effect_checkpoint(&env, &cp.effect_id), Some(cp));
+        });
+    }
+
+    #[test]
+    fn test_unknown_effect_id_returns_not_found() {
+        let (env, contract_id, admin, actor, _target) = setup();
+        let missing = BytesN::from_array(&env, &[7u8; 32]);
+
+        env.as_contract(&contract_id, || {
+            assert_eq!(get_side_effect_checkpoint(&env, &missing), None);
+            assert_eq!(
+                commit_side_effect(&env, &actor, &missing),
+                Err(Error::NotFound)
+            );
+            assert_eq!(
+                fail_side_effect(&env, &actor, &missing, 1),
+                Err(Error::NotFound)
+            );
+            assert_eq!(
+                rollback_side_effect(&env, &admin, &missing, symbol_short!("x")),
+                Err(Error::NotFound)
+            );
+        });
+    }
+
+    #[test]
+    fn test_commit_after_failure_and_idempotent_commit_clear_error() {
+        let (env, contract_id, _admin, actor, target) = setup();
+        let payload_hash: BytesN<32> = env.crypto().sha256(&Bytes::from_slice(&env, b"p")).into();
+
+        env.as_contract(&contract_id, || {
+            let cp = begin_execute(&env, &actor, &target, &payload_hash);
+            fail_side_effect(&env, &actor, &cp.effect_id, 42).unwrap();
+
+            // The external call actually landed after the failure was recorded.
+            let committed = commit_side_effect(&env, &actor, &cp.effect_id).unwrap();
+            assert_eq!(committed.state, SideEffectState::Committed);
+            assert_eq!(committed.last_error, 0);
+
+            // Repeating the commit returns the same checkpoint.
+            assert_eq!(
+                commit_side_effect(&env, &actor, &cp.effect_id),
+                Ok(committed)
+            );
+        });
+    }
+
+    #[test]
+    fn test_distinct_payloads_get_independent_checkpoints() {
+        let (env, contract_id, _admin, actor, target) = setup();
+        let h1: BytesN<32> = env.crypto().sha256(&Bytes::from_slice(&env, b"one")).into();
+        let h2: BytesN<32> = env.crypto().sha256(&Bytes::from_slice(&env, b"two")).into();
+
+        env.as_contract(&contract_id, || {
+            let first = begin_execute(&env, &actor, &target, &h1);
+            commit_side_effect(&env, &actor, &first.effect_id).unwrap();
+
+            // Same op/step/target but another payload is a new effect, not AlreadyCommitted.
+            let second = begin_execute(&env, &actor, &target, &h2);
+            assert_ne!(first.effect_id, second.effect_id);
+            assert_eq!(second.attempts, 1);
+        });
+    }
 }

@@ -194,7 +194,7 @@ mod tests {
     #[test]
     fn test_deprecation_lifecycle_and_sunset() {
         let env = Env::default();
-        let name = symbol_short!("token_gate");
+        let name = symbol_short!("tok_gate");
         let versions = [1u32, 2u32];
         let replacement = Address::generate(&env);
 

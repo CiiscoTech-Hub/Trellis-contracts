@@ -380,4 +380,3 @@ pub fn exit_guarded(env: &Env) {
         .instance()
         .set(&CallDepthKey::Depth, &depth.saturating_sub(1));
 }
-}
