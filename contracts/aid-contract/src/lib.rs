@@ -888,6 +888,22 @@ impl AidContract {
         Ok(())
     }
 
+    /// Redeem one verified tranche-locked aid voucher.
+    ///
+    /// This is the voucher-facing name for [`AidContract::claim_aid_milestone`].
+    /// The recipient must authorize the call, the tranche must belong to the
+    /// aid record and be verified, and redemption is rejected after the aid's
+    /// expiry ledger. The existing milestone entry point remains available for
+    /// clients that already use it.
+    pub fn redeem_aid_voucher(
+        env: Env,
+        recipient: Address,
+        aid_id: u64,
+        tranche_index: u32,
+    ) -> Result<(), AidError> {
+        Self::claim_aid_milestone(env, recipient, aid_id, tranche_index)
+    }
+
     /// Refund the unclaimed remainder of an expired milestone aid.
     ///
     /// Only the donor or admin may call. Transfers the sum of all unclaimed
@@ -935,6 +951,20 @@ impl AidContract {
 
         emit(&env, AID_REFUNDED, (aid_id, correlation::load(&env, aid_id)));
         Ok(())
+    }
+
+    /// Claw back every unredeemed tranche of an expired aid voucher program.
+    ///
+    /// This is the voucher-facing name for
+    /// [`AidContract::refund_milestone_aid`]. Only the donor or admin may
+    /// trigger it, and it is strictly unavailable on the expiry ledger itself.
+    /// Already redeemed tranches are never clawed back.
+    pub fn clawback_expired_aid_voucher(
+        env: Env,
+        caller: Address,
+        aid_id: u64,
+    ) -> Result<(), AidError> {
+        Self::refund_milestone_aid(env, caller, aid_id)
     }
 
     /// Grant or revoke the Inspector role for milestone verification.
@@ -1452,15 +1482,30 @@ fn contains_id(ids: &Vec<u64>, wanted: u64) -> bool {
     false
 }
 
+/// Add `aid_id` to the derived discovery index, keeping it sorted ascending.
+///
+/// The keyset cursor (`search_aids_cursor` → `shared::paginate_id_list`)
+/// binary-searches this index, so it must stay sorted. Appending would break
+/// that whenever an older record re-enters the index: an admin un-hiding a
+/// record via `set_aid_search_visibility` pushed it behind newer IDs, so
+/// cursor pages skipped it (Issue #480).
 fn index_aid(env: &Env, aid_id: u64) {
     if storage::is_search_hidden(env, aid_id) {
         return;
     }
     let mut ids = storage::get_search_index(env);
-    if !contains_id(&ids, aid_id) {
-        ids.push_back(aid_id);
-        storage::set_search_index(env, &ids);
+    let mut position = ids.len();
+    for (i, id) in ids.iter().enumerate() {
+        if id == aid_id {
+            return;
+        }
+        if id > aid_id {
+            position = i as u32;
+            break;
+        }
     }
+    ids.insert(position, aid_id);
+    storage::set_search_index(env, &ids);
 }
 
 fn index_aids(env: &Env, new_ids: &Vec<u64>) {
@@ -1525,3 +1570,10 @@ mod profile_budget;
 
 #[cfg(test)]
 mod aid_export_test;
+
+#[cfg(test)]
+mod invariants_test;
+
+/// Authorization tests for hidden and archived records (Issue #480).
+#[cfg(test)]
+mod hidden_archived_auth_test;

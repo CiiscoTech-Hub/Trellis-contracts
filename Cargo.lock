@@ -1055,6 +1055,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "referral-commission-guard"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk",
+]
+
+[[package]]
 name = "referral-contract"
 version = "0.1.0"
 dependencies = [
@@ -1073,6 +1080,13 @@ name = "registry-contract"
 version = "0.1.0"
 dependencies = [
  "shared",
+ "soroban-sdk",
+]
+
+[[package]]
+name = "retention-enforcement"
+version = "0.1.0"
+dependencies = [
  "soroban-sdk",
 ]
 
@@ -1267,6 +1281,14 @@ checksum = "77549399552de45a898a580c1b41d445bf730df867cc44e6c0233bbc4b8329de"
 dependencies = [
  "digest",
  "rand_core 0.6.4",
+]
+
+[[package]]
+name = "signed-audit-receipts"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "soroban-sdk",
 ]
 
 [[package]]

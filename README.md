@@ -817,6 +817,11 @@ are removed from the derived search index. Administrators can run
 the return value reports indexed, added, and removed entries. No migration is
 required: older records are included on the next repair run.
 
+Hidden records stay in their owners' listings and remain claimable and
+refundable; hiding controls discovery, not confidentiality. See
+[`docs/HIDDEN_ARCHIVED_RECORDS.md`](docs/HIDDEN_ARCHIVED_RECORDS.md) for the
+full authorization matrix, edge cases, and recovery procedure.
+
 ### Admin Controls
 
 #### `set_paused`

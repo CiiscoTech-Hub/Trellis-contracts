@@ -464,4 +464,233 @@ mod tests {
             );
         });
     }
+
+    fn setup() -> (Env, Address, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, MockContract);
+        let admin = Address::generate(&env);
+        (env, contract_id, admin)
+    }
+
+    fn ev(seq: u64, kind: ReplayEventKind, amount: i128) -> ReplayEvent {
+        ReplayEvent {
+            seq,
+            schema_version: 2,
+            kind,
+            amount,
+        }
+    }
+
+    #[test]
+    fn plan_rejects_zero_id_and_duplicate_session() {
+        let (env, contract_id, admin) = setup();
+        env.as_contract(&contract_id, || {
+            initialize_admin(&env, &admin).unwrap();
+            let base = empty_projection(&env, 1);
+
+            assert_eq!(
+                plan_replay(&env, &admin, 0, 2, base.clone()),
+                Err(Error::InvalidArgument)
+            );
+
+            let first = plan_replay(&env, &admin, 7, 2, base.clone()).unwrap();
+            assert_eq!(
+                plan_replay(&env, &admin, 7, 2, base),
+                Err(Error::AlreadyClaimed)
+            );
+            // The rejected duplicate leaves the stored session untouched.
+            assert_eq!(get_replay_session(&env, 7), Some(first));
+        });
+    }
+
+    #[test]
+    fn batch_size_bounds_and_unknown_session() {
+        let (env, contract_id, admin) = setup();
+        env.as_contract(&contract_id, || {
+            initialize_admin(&env, &admin).unwrap();
+            plan_replay(&env, &admin, 1, 2, empty_projection(&env, 1)).unwrap();
+
+            let empty = Vec::new(&env);
+            assert_eq!(
+                apply_replay_batch(&env, &admin, 1, &empty),
+                Err(Error::InvalidArgument)
+            );
+
+            let mut oversized = Vec::new(&env);
+            for seq in 1..=(MAX_REPLAY_BATCH as u64 + 1) {
+                oversized.push_back(ev(seq, ReplayEventKind::Credit, 1));
+            }
+            assert_eq!(
+                apply_replay_batch(&env, &admin, 1, &oversized),
+                Err(Error::InvalidArgument)
+            );
+            // Rejected batches do not advance the session.
+            let session = get_replay_session(&env, 1).unwrap();
+            assert_eq!(session.cursor_seq, 0);
+            assert_eq!(session.status, ReplayStatus::Planned);
+
+            let mut one = Vec::new(&env);
+            one.push_back(ev(1, ReplayEventKind::Credit, 1));
+            assert_eq!(
+                apply_replay_batch(&env, &admin, 99, &one),
+                Err(Error::NotFound)
+            );
+            assert_eq!(complete_replay(&env, &admin, 99), Err(Error::NotFound));
+            assert_eq!(rollback_replay(&env, &admin, 99), Err(Error::NotFound));
+        });
+    }
+
+    #[test]
+    fn max_size_batch_is_accepted_and_checksum_matches_projection() {
+        let (env, contract_id, admin) = setup();
+        env.as_contract(&contract_id, || {
+            initialize_admin(&env, &admin).unwrap();
+            plan_replay(&env, &admin, 1, 2, empty_projection(&env, 2)).unwrap();
+
+            let mut batch = Vec::new(&env);
+            for seq in 1..=(MAX_REPLAY_BATCH as u64) {
+                batch.push_back(ev(seq, ReplayEventKind::Credit, 2));
+            }
+            let session = apply_replay_batch(&env, &admin, 1, &batch).unwrap();
+            let proj = session.current_projection;
+            assert_eq!(proj.total_balance, 2 * MAX_REPLAY_BATCH as i128);
+            assert_eq!(proj.event_count, MAX_REPLAY_BATCH as u64);
+            assert_eq!(proj.last_seq, MAX_REPLAY_BATCH as u64);
+            assert_eq!(
+                proj.checksum,
+                compute_projection_checksum(
+                    &env,
+                    proj.schema_version,
+                    proj.last_seq,
+                    proj.total_balance,
+                    proj.event_count
+                )
+            );
+        });
+    }
+
+    #[test]
+    fn reset_semantics_differ_between_v1_and_v2_targets() {
+        let (env, contract_id, admin) = setup();
+        env.as_contract(&contract_id, || {
+            initialize_admin(&env, &admin).unwrap();
+
+            for (id, target, expected) in [(1u64, 1u32, 40i128), (2u64, 2u32, 0i128)] {
+                plan_replay(&env, &admin, id, target, empty_projection(&env, 1)).unwrap();
+                let mut batch = Vec::new(&env);
+                batch.push_back(ev(1, ReplayEventKind::Credit, 500));
+                batch.push_back(ev(2, ReplayEventKind::Reset, 40));
+                let session = apply_replay_batch(&env, &admin, id, &batch).unwrap();
+                assert_eq!(session.current_projection.total_balance, expected);
+                assert_eq!(session.current_projection.event_count, 2);
+            }
+        });
+    }
+
+    #[test]
+    fn overflow_and_unsupported_event_version_fail_the_session() {
+        let (env, contract_id, admin) = setup();
+        env.as_contract(&contract_id, || {
+            initialize_admin(&env, &admin).unwrap();
+
+            plan_replay(&env, &admin, 1, 2, empty_projection(&env, 1)).unwrap();
+            let mut big = Vec::new(&env);
+            big.push_back(ev(1, ReplayEventKind::Credit, i128::MAX));
+            big.push_back(ev(2, ReplayEventKind::Credit, 1));
+            assert_eq!(
+                apply_replay_batch(&env, &admin, 1, &big),
+                Err(Error::Overflow)
+            );
+            assert_eq!(
+                get_replay_session(&env, 1).unwrap().status,
+                ReplayStatus::Failed
+            );
+
+            plan_replay(&env, &admin, 2, 2, empty_projection(&env, 1)).unwrap();
+            let mut bad_version = Vec::new(&env);
+            bad_version.push_back(ReplayEvent {
+                seq: 1,
+                schema_version: 3,
+                kind: ReplayEventKind::Credit,
+                amount: 1,
+            });
+            assert_eq!(
+                apply_replay_batch(&env, &admin, 2, &bad_version),
+                Err(Error::UnsupportedSchemaVersion)
+            );
+            assert_eq!(
+                get_replay_session(&env, 2).unwrap().status,
+                ReplayStatus::Failed
+            );
+
+            plan_replay(&env, &admin, 3, 2, empty_projection(&env, 1)).unwrap();
+            let mut negative = Vec::new(&env);
+            negative.push_back(ev(1, ReplayEventKind::Credit, -5));
+            assert_eq!(
+                apply_replay_batch(&env, &admin, 3, &negative),
+                Err(Error::SchemaMigrationFailed)
+            );
+        });
+    }
+
+    #[test]
+    fn terminal_sessions_reject_further_batches_and_lifecycle_is_idempotent() {
+        let (env, contract_id, admin) = setup();
+        env.as_contract(&contract_id, || {
+            initialize_admin(&env, &admin).unwrap();
+            plan_replay(&env, &admin, 1, 2, empty_projection(&env, 1)).unwrap();
+
+            let mut batch = Vec::new(&env);
+            batch.push_back(ev(1, ReplayEventKind::Credit, 10));
+            apply_replay_batch(&env, &admin, 1, &batch).unwrap();
+
+            let done = complete_replay(&env, &admin, 1).unwrap();
+            assert_eq!(complete_replay(&env, &admin, 1), Ok(done));
+
+            let mut next = Vec::new(&env);
+            next.push_back(ev(2, ReplayEventKind::Credit, 10));
+            assert_eq!(
+                apply_replay_batch(&env, &admin, 1, &next),
+                Err(Error::InvalidArgument)
+            );
+
+            // A completed projection can still be rolled back, and repeating it is a no-op.
+            let rolled = rollback_replay(&env, &admin, 1).unwrap();
+            assert_eq!(rolled.status, ReplayStatus::RolledBack);
+            assert_eq!(rolled.current_projection, rolled.pre_replay_snapshot);
+            assert_eq!(rollback_replay(&env, &admin, 1), Ok(rolled));
+            assert_eq!(
+                complete_replay(&env, &admin, 1),
+                Err(Error::InvalidArgument)
+            );
+        });
+    }
+
+    #[test]
+    fn failed_session_cannot_be_completed_or_resumed() {
+        let (env, contract_id, admin) = setup();
+        env.as_contract(&contract_id, || {
+            initialize_admin(&env, &admin).unwrap();
+            plan_replay(&env, &admin, 1, 2, empty_projection(&env, 1)).unwrap();
+
+            let mut bad = Vec::new(&env);
+            bad.push_back(ev(1, ReplayEventKind::Debit, 1));
+            assert_eq!(
+                apply_replay_batch(&env, &admin, 1, &bad),
+                Err(Error::SchemaMigrationFailed)
+            );
+
+            assert_eq!(
+                complete_replay(&env, &admin, 1),
+                Err(Error::InvalidArgument)
+            );
+            let mut good = Vec::new(&env);
+            good.push_back(ev(1, ReplayEventKind::Credit, 1));
+            assert_eq!(
+                apply_replay_batch(&env, &admin, 1, &good),
+                Err(Error::InvalidArgument)
+            );
+        });
+    }
 }

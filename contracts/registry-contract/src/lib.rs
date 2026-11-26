@@ -27,6 +27,11 @@
 //! For full API details, see the module items below.
 
 use shared::events::{emit_action_executed, emit_module_initialized};
+use shared::{
+    get_public_status, list_dependency_health, set_dependency_health,
+    set_public_status, DependencyHealth, DependencyStatus, PublicStatus, PublicStatusReason,
+    PublicStatusRecord,
+};
 use shared::storage::{persistent_get, persistent_read, persistent_remove, persistent_set};
 use shared::{auth, errors::Error};
 use soroban_sdk::{
@@ -94,6 +99,16 @@ pub struct DeactivationState {
     pub deactivated: bool,
     pub deactivated_at: u64,
 }
+
+/// Public, dependency-aware health response. All fields are bounded and use
+/// closed enums so the endpoint cannot disclose private diagnostics.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HealthSnapshot {
+    pub status: PublicStatusRecord,
+    pub dependencies: Vec<DependencyHealth>,
+    pub checked_at_ledger: u32,
+}
 // ===========================================================================
 // Contract Implementation
 #[contract]
@@ -122,6 +137,41 @@ impl RegistryContract {
             env.ledger().timestamp(),
         );
         Ok(())
+    }
+
+    /// Read the public health endpoint. This is intentionally unauthenticated
+    /// and returns the latest dependency state plus a deterministic freshness
+    /// marker for load balancers and operators.
+    pub fn health(env: Env) -> HealthSnapshot {
+        HealthSnapshot {
+            status: get_public_status(&env),
+            dependencies: list_dependency_health(&env),
+            checked_at_ledger: env.ledger().sequence(),
+        }
+    }
+
+    /// Publish the top-level public status. Only the registry admin may do so;
+    /// invalid status/reason pairs are rejected before storage is changed.
+    pub fn set_health_status(
+        env: Env,
+        caller: Address,
+        status: PublicStatus,
+        reason: PublicStatusReason,
+    ) -> Result<PublicStatusRecord, Error> {
+        set_public_status(&env, &caller, status, reason)
+    }
+
+    /// Record a dependency check through the authenticated admin path. A
+    /// healthy report resets the retry failure counter; degraded/down reports
+    /// increment it, allowing clients to distinguish recovery from retries.
+    pub fn report_dependency(
+        env: Env,
+        caller: Address,
+        name: Symbol,
+        status: DependencyStatus,
+    ) -> Result<DependencyHealth, Error> {
+        shared::auth::require_admin(&env, &caller)?;
+        Ok(set_dependency_health(&env, &name, status))
     }
 
     // ─── Contract Registration ─────────────────────────────────────────────
@@ -1078,6 +1128,47 @@ mod tests {
         assert_eq!(names.len(), 2);
         assert!(names.iter().any(|n| n == name1));
         assert!(names.iter().any(|n| n == name2));
+    }
+
+    #[test]
+    fn health_endpoint_covers_recovery_and_authorization_paths() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let registry_id = env.register_contract(None, RegistryContract);
+        let admin = Address::generate(&env);
+        let other = Address::generate(&env);
+        let registry = RegistryContractClient::new(&env, &registry_id);
+        registry.initialize(&admin);
+
+        assert_eq!(registry.health().status.status, shared::PublicStatus::Unknown);
+        registry.set_health_status(
+            &admin,
+            &shared::PublicStatus::Degraded,
+            &shared::PublicStatusReason::DependencyUnavailable,
+        ).unwrap();
+        let name = Symbol::new(&env, "rpc");
+        registry.report_dependency(&admin, &name, &shared::DependencyStatus::Down).unwrap();
+        let failed = registry.health();
+        assert_eq!(failed.status.status, shared::PublicStatus::Degraded);
+        assert_eq!(failed.dependencies.get(0).unwrap().failure_count, 1);
+
+        registry.report_dependency(&admin, &name, &shared::DependencyStatus::Healthy).unwrap();
+        registry.set_health_status(
+            &admin,
+            &shared::PublicStatus::Operational,
+            &shared::PublicStatusReason::Normal,
+        ).unwrap();
+        let recovered = registry.health();
+        assert_eq!(recovered.status.status, shared::PublicStatus::Operational);
+        assert_eq!(recovered.dependencies.get(0).unwrap().failure_count, 0);
+
+        assert!(registry
+            .try_set_health_status(
+                &other,
+                &shared::PublicStatus::Paused,
+                &shared::PublicStatusReason::EmergencyPause,
+            )
+            .is_err());
     }
 
     #[test]

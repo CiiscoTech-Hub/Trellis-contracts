@@ -15,6 +15,10 @@
 - **Invariant Failure**: Negative amounts, underflow on `Debit`, or overflow on `Credit` mark the session `ReplayStatus::Failed` and return `Error::SchemaMigrationFailed` or `Error::Overflow` while preserving `pre_replay_snapshot`.
 - **Rollback (`rollback_replay`)**: Restores `current_projection = pre_replay_snapshot` and sets `ReplayStatus::RolledBack` (idempotent on repeated calls).
 - **Authorization**: All replay lifecycle functions enforce `require_admin`.
+- **Session identity**: `session_id == 0` fails with `Error::InvalidArgument`; planning an existing `session_id` fails with `Error::AlreadyClaimed` and leaves the stored session unchanged.
+- **Batch bounds**: An empty batch or one larger than `MAX_REPLAY_BATCH` fails with `Error::InvalidArgument` before any event is applied. An unknown `session_id` returns `Error::NotFound` from apply, complete and rollback.
+- **Reset by target version**: `Reset` zeroes the projection for a v2 target and sets it to the event amount for a v1 target.
+- **Terminal sessions**: `Completed`, `RolledBack` and `Failed` sessions reject further batches with `Error::InvalidArgument`. `complete_replay` is idempotent on a `Completed` session and rejects `Failed` and `RolledBack` ones. A `Completed` session can still be rolled back to its pre-replay snapshot.
 
 ## Contract Preservation
 
