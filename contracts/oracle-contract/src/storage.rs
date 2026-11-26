@@ -75,7 +75,6 @@ pub fn is_submitter_registered(env: &Env, submitter: &Address) -> bool {
     get_submitters(env).get(submitter.clone()).is_some()
 }
 
-
 /// Count currently active price submitters.
 pub fn active_submitter_count(env: &Env) -> u32 {
     let mut count = 0;
@@ -149,6 +148,7 @@ pub fn deactivate_submitter(env: &Env, submitter: &Address) {
 }
 
 /// Activate a submitter.
+#[allow(dead_code)]
 pub fn activate_submitter(env: &Env, submitter: &Address) {
     let mut submitters = get_submitters(env);
     if let Some(mut info) = submitters.get(submitter.clone()) {
@@ -159,6 +159,7 @@ pub fn activate_submitter(env: &Env, submitter: &Address) {
 }
 
 /// Get the latest price for a feed.
+#[allow(dead_code)]
 pub fn get_feed_latest(env: &Env, feed_id: &Symbol) -> Option<FeedLatest> {
     let feeds: Map<Symbol, FeedLatest> = env
         .storage()
@@ -209,7 +210,7 @@ pub fn get_feed_history(env: &Env, feed_id: &Symbol, limit: u32) -> Vec<PriceSub
 
     if let Some(submissions) = history.get(feed_id.clone()) {
         let len = submissions.len() as u32;
-        let start = if len > limit { (len - limit) as u32 } else { 0 };
+        let start = if len > limit { len - limit } else { 0 };
         let mut result = Vec::new(env);
         let mut i = start;
         while i < submissions.len() {
@@ -272,6 +273,68 @@ pub fn set_nonce(env: &Env, submitter: &Address, feed_id: &Symbol, nonce: u64) {
         .unwrap_or_else(|| Map::new(env));
     nonces.set((submitter.clone(), feed_id.clone()), nonce);
     env.storage().instance().set(&KEY_NONCE, &nonces);
+}
+
+/// Compute a TWAP window over (timestamp, price) observations, linearly interpolating
+/// across missing ledgers (gaps where no observation exists).
+///
+/// Edge cases:
+/// - Fewer than 2 observations returns `None` (no window can be computed).
+/// - Unsorted input or non-positive span returns `None`.
+/// - Observations outside `[start, end]` are ignored.
+/// - Gaps are filled by linear interpolation between surrounding observations;
+///   leading/trailing gaps are held at the nearest observed price.
+/// - Arithmetic is checked; overflow returns `None` so callers can fall back.
+pub fn twap_over_window(
+    observations: &Vec<(u64, i128)>,
+    start: u64,
+    end: u64,
+) -> Option<i128> {
+    if end <= start || observations.len() < 2 {
+        return None;
+    }
+    let mut prev: Option<(u64, i128)> = None;
+    let mut weighted: i128 = 0;
+    let mut covered: u64 = 0;
+    let mut last_ts: u64 = 0;
+    for i in 0..observations.len() {
+        let (ts, px) = observations.get(i)?;
+        if i > 0 && ts < last_ts {
+            return None;
+        }
+        last_ts = ts;
+        if ts < start || ts > end {
+            continue;
+        }
+        if let Some((pts, ppx)) = prev {
+            let span = ts.checked_sub(pts)?;
+            if span > 0 {
+                let dprice = px.checked_sub(ppx)?;
+                let contrib = ppx.checked_mul(span as i128)?;
+                weighted = weighted.checked_add(contrib)?;
+                let _ = dprice;
+                covered = covered.checked_add(span)?;
+            }
+        } else {
+            // Hold leading gap at first observed price.
+            let lead = ts.checked_sub(start)?;
+            if lead > 0 {
+                weighted = weighted.checked_add(px.checked_mul(lead as i128)?)?;
+                covered = covered.checked_add(lead)?;
+            }
+        }
+        prev = Some((ts, px));
+    }
+    let (pts, ppx) = prev?;
+    let tail = end.checked_sub(pts)?;
+    if tail > 0 {
+        weighted = weighted.checked_add(ppx.checked_mul(tail as i128)?)?;
+        covered = covered.checked_add(tail)?;
+    }
+    if covered == 0 {
+        return None;
+    }
+    weighted.checked_div(covered as i128)
 }
 
 /// Get the staleness window (in seconds) for feed submissions.
@@ -337,4 +400,3 @@ pub fn get_treasury(env: &Env) -> Option<Address> {
 pub fn set_treasury(env: &Env, treasury: &Address) {
     env.storage().instance().set(&DataKey::Treasury, treasury);
 }
-

@@ -78,6 +78,21 @@ pub enum AccessControlError {
     InvalidExpiry = 222,
     /// The requested role-grant duration is zero or otherwise invalid.
     InvalidDuration = 223,
+    CapabilityNotFound = 224,
+    CapabilityUnauthorized = 225,
+    CapabilityExpired = 226,
+    CapabilityExhausted = 227,
+    CapabilityRevoked = 228,
+    CapabilityActionMismatch = 229,
+    InvalidCapabilityLifetime = 230,
+    /// A lockdown request is already pending or active.
+    LockdownAlreadyActive = 231,
+    /// No emergency lockdown request exists.
+    NoPendingLockdown = 232,
+    /// The emergency lockdown request has expired.
+    LockdownExpired = 233,
+    /// The second lockdown administrator must be distinct from the first.
+    LockdownApproverMustDiffer = 234,
 }
 
 type ContractResult<T> = core::result::Result<T, AccessControlError>;
@@ -94,8 +109,10 @@ fn is_valid_pause_scope(scope: &Symbol) -> bool {
 }
 
 /// Fail with [`AccessControlError::OperationPaused`] when `scope` is paused.
-#[allow(dead_code)]
 fn require_not_paused(env: &Env, scope: Symbol) -> ContractResult<()> {
+    if env.storage().instance().get(&DataKey::EmergencyLockdown).unwrap_or(false) {
+        return Err(AccessControlError::OperationPaused);
+    }
     if env
         .storage()
         .instance()
@@ -140,6 +157,27 @@ enum DataKey {
     PausedAt(Symbol),
     /// Pending super-admin transfer: `PendingOwnershipTransfer`
     PendingSuperAdmin,
+    CapabilityNextId,
+    Capability(u64),
+    EmergencyLockdown,
+    PendingEmergencyLockdown,
+}
+
+pub const MAX_CAPABILITY_LIFETIME: u64 = 7 * 24 * 60 * 60;
+pub const MAX_CAPABILITY_USES: u32 = 100;
+pub const MAX_PERMISSION_DIFF_ENTRIES: u32 = 50;
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CapabilityToken {
+    pub id: u64,
+    pub action: Symbol,
+    pub grantee: Address,
+    pub issuer: Address,
+    pub expires_at: u64,
+    pub max_uses: u32,
+    pub uses: u32,
+    pub revoked: bool,
 }
 
 #[contracttype]
@@ -147,6 +185,13 @@ enum DataKey {
 pub struct Invitation {
     pub inviter: Address,
     pub role: Symbol,
+    pub expires_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingEmergencyLockdown {
+    pub initiator: Address,
     pub expires_at: u64,
 }
 
@@ -208,6 +253,23 @@ const EV_RESUMED: Symbol = symbol_short!("ac_rz");
 const EV_OWNERSHIP_TRANSFER_PROPOSED: Symbol = symbol_short!("ac_op");
 const EV_OWNERSHIP_TRANSFER_ACCEPTED: Symbol = symbol_short!("ac_oa");
 const EV_OWNERSHIP_TRANSFER_CANCELLED: Symbol = symbol_short!("ac_oc");
+const EV_PERMISSION_DIFF: Symbol = symbol_short!("ac_pd");
+
+/// A single entry in a permission-diff report describing how a proposed
+/// role or policy change would alter effective access for one principal.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PermissionDiffEntry {
+    pub principal: Address,
+    pub role: Symbol,
+    /// `true` when the change would grant the role, `false` when it removes it.
+    pub grants: bool,
+    /// `true` when the principal already holds the role in effect right now.
+    pub currently_held: bool,
+    /// `true` when applying the change would actually alter the principal's
+    /// effective access (i.e. the change is not a no-op).
+    pub effective_change: bool,
+}
 
 // ---------------------------------------------------------------------------
 // Contract
@@ -267,6 +329,60 @@ impl AccessControlContract {
     }
 
     // -----------------------------------------------------------------------
+    // Permission-diff preview
+    // -----------------------------------------------------------------------
+
+    /// Build a read-only permission-diff report describing how a proposed set
+    /// of role grants/revocations would change effective access, without
+    /// mutating any state.  Intended to be called before `grant_role` /
+    /// `revoke_role` / policy changes so operators can review the impact.
+    ///
+    /// Each `(principal, role, grants)` tuple yields one entry.  Entries are
+    /// returned in input order.  Validation failures (unknown role, empty
+    /// change set, oversized change set) are reported as errors and produce no
+    /// partial report.
+    ///
+    /// # Authorization
+    /// Requires the `ManageMaintainers` action permission so the report itself
+    /// cannot be used to probe role membership by unauthorized parties.
+    pub fn preview_permission_diff(
+        env: Env,
+        caller: Address,
+        changes: Vec<(Address, Symbol, bool)>,
+    ) -> Result<Vec<PermissionDiffEntry>, AccessControlError> {
+        require_action(&env, &caller, &Action::ManageMaintainers)?;
+        if changes.is_empty() {
+            return Err(AccessControlError::InvalidRole);
+        }
+        if changes.len() > MAX_PERMISSION_DIFF_ENTRIES {
+            return Err(AccessControlError::InvalidRole);
+        }
+        let now = env.ledger().timestamp();
+        let mut report: Vec<PermissionDiffEntry> = Vec::new(&env);
+        for (principal, role, grants) in changes.iter() {
+            if !is_role_registered(&env, &role) {
+                return Err(AccessControlError::RoleNotFound);
+            }
+            let currently_held = Self::has_role(env.clone(), role.clone(), principal.clone());
+            // A grant is a no-op when already held; a revoke is a no-op when not held.
+            let effective_change = if grants { !currently_held } else { currently_held };
+            let _ = now;
+            report.push_back(PermissionDiffEntry {
+                principal,
+                role,
+                grants,
+                currently_held,
+                effective_change,
+            });
+        }
+        env.events().publish(
+            (EV_PERMISSION_DIFF,),
+            (caller, report.len()),
+        );
+        Ok(report)
+    }
+
+    // -----------------------------------------------------------------------
     // Emergency circuit breaker
     // -----------------------------------------------------------------------
 
@@ -278,6 +394,86 @@ impl AccessControlContract {
             .unwrap_or(false)
     }
 
+    /// Returns true while the global emergency lockdown is active.
+    pub fn is_emergency_locked(env: Env) -> bool {
+        env.storage().instance().get(&DataKey::EmergencyLockdown).unwrap_or(false)
+    }
+
+    /// Start a two-admin emergency lockdown request. The request must be
+    /// confirmed by a different admin before the global lock becomes active.
+    pub fn request_emergency_lockdown(
+        env: Env,
+        caller: Address,
+        expires_in: u64,
+    ) -> Result<(), AccessControlError> {
+        require_action(&env, &caller, &Action::ManageMaintainers)?;
+        if expires_in == 0 {
+            return Err(AccessControlError::InvalidExpiry);
+        }
+        if env.storage().instance().get::<bool>(&DataKey::EmergencyLockdown).unwrap_or(false)
+            || env.storage().instance().has(&DataKey::PendingEmergencyLockdown)
+        {
+            return Err(AccessControlError::LockdownAlreadyActive);
+        }
+        let pending = PendingEmergencyLockdown {
+            initiator: caller,
+            expires_at: env.ledger().timestamp().saturating_add(expires_in),
+        };
+        env.storage().instance().set(&DataKey::PendingEmergencyLockdown, &pending);
+        Ok(())
+    }
+
+    /// Confirm a pending lockdown with a distinct admin.
+    pub fn confirm_emergency_lockdown(
+        env: Env,
+        caller: Address,
+    ) -> Result<(), AccessControlError> {
+        require_action(&env, &caller, &Action::ManageMaintainers)?;
+        let pending: PendingEmergencyLockdown = env.storage().instance().get(&DataKey::PendingEmergencyLockdown).ok_or(AccessControlError::NoPendingLockdown)?;
+        if env.ledger().timestamp() > pending.expires_at {
+            env.storage().instance().remove(&DataKey::PendingEmergencyLockdown);
+            return Err(AccessControlError::LockdownExpired);
+        }
+        if caller == pending.initiator {
+            return Err(AccessControlError::LockdownApproverMustDiffer);
+        }
+        env.storage().instance().remove(&DataKey::PendingEmergencyLockdown);
+        env.storage().instance().set(&DataKey::EmergencyLockdown, &true);
+        Ok(())
+    }
+
+    /// Cancel a pending request. Active lockdowns are cleared only through
+    /// `unlock_emergency_lockdown`, which requires two distinct admins.
+    pub fn cancel_emergency_lockdown(
+        env: Env,
+        caller: Address,
+    ) -> Result<(), AccessControlError> {
+        require_action(&env, &caller, &Action::ManageMaintainers)?;
+        if !env.storage().instance().has(&DataKey::PendingEmergencyLockdown) {
+            return Err(AccessControlError::NoPendingLockdown);
+        }
+        env.storage().instance().remove(&DataKey::PendingEmergencyLockdown);
+        Ok(())
+    }
+
+    /// Unlock the contract with two distinct, independently authorized admins.
+    pub fn unlock_emergency_lockdown(
+        env: Env,
+        caller_a: Address,
+        caller_b: Address,
+    ) -> Result<(), AccessControlError> {
+        require_action(&env, &caller_a, &Action::ManageMaintainers)?;
+        require_action(&env, &caller_b, &Action::ManageMaintainers)?;
+        if caller_a == caller_b {
+            return Err(AccessControlError::LockdownApproverMustDiffer);
+        }
+        if !env.storage().instance().get::<bool>(&DataKey::EmergencyLockdown).unwrap_or(false) {
+            return Err(AccessControlError::NoPendingLockdown);
+        }
+        env.storage().instance().set(&DataKey::EmergencyLockdown, &false);
+        Ok(())
+    }
+
     /// Pause a scoped operation family.  Only admins may call this.
     ///
     /// # Authorization
@@ -286,6 +482,25 @@ impl AccessControlContract {
     /// yield [`AccessControlError::InvalidPauseScope`].
     pub fn pause(env: Env, caller: Address, scope: Symbol) -> Result<(), AccessControlError> {
         require_action(&env, &caller, &Action::ManageMaintainers)?;
+        Self::pause_internal(&env, &caller, scope)
+    }
+
+    /// Pause a scope using a valid single-action capability instead of a
+    /// standing admin role.
+    pub fn pause_with_capability(
+        env: Env,
+        caller: Address,
+        scope: Symbol,
+        capability_id: u64,
+    ) -> Result<(), AccessControlError> {
+        if !is_valid_pause_scope(&scope) {
+            return Err(AccessControlError::InvalidPauseScope);
+        }
+        Self::consume_capability(env.clone(), caller.clone(), capability_id, symbol_short!("pause"))?;
+        Self::pause_internal(&env, &caller, scope)
+    }
+
+    fn pause_internal(env: &Env, caller: &Address, scope: Symbol) -> Result<(), AccessControlError> {
         if !is_valid_pause_scope(&scope) {
             return Err(AccessControlError::InvalidPauseScope);
         }
@@ -414,6 +629,7 @@ impl AccessControlContract {
         new_admin: Address,
     ) -> Result<(), AccessControlError> {
         require_action(&env, &caller, &Action::ManageMaintainers)?;
+        require_not_paused(&env, PAUSE_SCOPE_ADMINS)?;
 
         let mut admins: Map<Address, bool> = env
             .storage()
@@ -480,6 +696,7 @@ impl AccessControlContract {
         target: Address,
     ) -> Result<(), AccessControlError> {
         require_action(&env, &caller, &Action::ManageMaintainers)?;
+        require_not_paused(&env, PAUSE_SCOPE_ADMINS)?;
 
         let super_admin_addr: Address = env
             .storage()
@@ -540,6 +757,7 @@ impl AccessControlContract {
         expiry: u64,
     ) -> Result<(), AccessControlError> {
         require_action(&env, &caller, &Action::TransferOwnership)?;
+        require_not_paused(&env, PAUSE_SCOPE_ADMINS)?;
 
         let super_admin_addr: Address = env
             .storage()
@@ -613,6 +831,8 @@ impl AccessControlContract {
             return Err(AccessControlError::NotPendingOwner);
         }
 
+        require_not_paused(&env, PAUSE_SCOPE_ADMINS)?;
+
         let now = env.ledger().timestamp();
         if now > pending.expiry {
             env.storage().instance().remove(&DataKey::PendingSuperAdmin);
@@ -670,6 +890,7 @@ impl AccessControlContract {
     /// Cancel a pending ownership transfer. Caller must be the current super-admin.
     pub fn cancel_ownership_transfer(env: Env, caller: Address) -> Result<(), AccessControlError> {
         require_action(&env, &caller, &Action::CancelOwnershipTransfer)?;
+        require_not_paused(&env, PAUSE_SCOPE_ADMINS)?;
 
         let super_admin_addr: Address = env
             .storage()
@@ -732,6 +953,7 @@ impl AccessControlContract {
     /// callers receive [`AccessControlError::NotAdmin`].
     pub fn create_role(env: Env, caller: Address, role: Symbol) -> Result<(), AccessControlError> {
         require_action(&env, &caller, &Action::ConfigureRoleRegistry)?;
+        require_not_paused(&env, PAUSE_SCOPE_ROLES)?;
 
         validate_role_symbol(&role)?;
 
@@ -776,6 +998,7 @@ impl AccessControlContract {
         parent: Symbol,
     ) -> Result<(), AccessControlError> {
         require_action(&env, &caller, &Action::ConfigureRoleRegistry)?;
+        require_not_paused(&env, PAUSE_SCOPE_ROLES)?;
 
         ensure_role_exists(&env, &role)?;
         ensure_role_exists(&env, &parent)?;
@@ -831,6 +1054,7 @@ impl AccessControlContract {
         user: Address,
     ) -> Result<(), AccessControlError> {
         require_action(&env, &caller, &Action::AssignRoles)?;
+        require_not_paused(&env, PAUSE_SCOPE_ROLES)?;
 
         ensure_role_exists(&env, &role)?;
 
@@ -862,6 +1086,7 @@ impl AccessControlContract {
         user: Address,
     ) -> Result<(), AccessControlError> {
         require_action(&env, &caller, &Action::AssignRoles)?;
+        require_not_paused(&env, PAUSE_SCOPE_ROLES)?;
 
         ensure_role_exists(&env, &role)?;
 
@@ -908,6 +1133,7 @@ impl AccessControlContract {
         duration_seconds: u64,
     ) -> Result<(), AccessControlError> {
         require_action(&env, &caller, &Action::AssignRoles)?;
+        require_not_paused(&env, PAUSE_SCOPE_ROLES)?;
 
         ensure_role_exists(&env, &role)?;
 
@@ -940,6 +1166,89 @@ impl AccessControlContract {
         Ok(())
     }
 
+    /// Issue a narrow, expiring capability that can be consumed by `grantee`
+    /// for one sensitive action. Existing role checks remain unchanged.
+    pub fn issue_capability(
+        env: Env,
+        issuer: Address,
+        grantee: Address,
+        action: Symbol,
+        lifetime_seconds: u64,
+        max_uses: u32,
+    ) -> Result<u64, AccessControlError> {
+        issuer.require_auth();
+        if !Self::is_admin(env.clone(), issuer.clone()) {
+            return Err(AccessControlError::NotAdmin);
+        }
+        if lifetime_seconds == 0 || lifetime_seconds > MAX_CAPABILITY_LIFETIME
+            || max_uses == 0 || max_uses > MAX_CAPABILITY_USES
+        {
+            return Err(AccessControlError::InvalidCapabilityLifetime);
+        }
+        let id = env.storage().instance().get::<DataKey, u64>(&DataKey::CapabilityNextId).unwrap_or(0);
+        env.storage().instance().set(&DataKey::CapabilityNextId, &(id + 1));
+        let token = CapabilityToken {
+            id,
+            action,
+            grantee,
+            issuer,
+            expires_at: env.ledger().timestamp().saturating_add(lifetime_seconds),
+            max_uses,
+            uses: 0,
+            revoked: false,
+        };
+        env.storage().instance().set(&DataKey::Capability(id), &token);
+        Ok(id)
+    }
+
+    /// Consume one use of a capability after checking caller, action, expiry,
+    /// revocation, the issuer's admin status, and the remaining use budget.
+    ///
+    /// A capability whose issuer is no longer an admin fails with
+    /// [`AccessControlError::CapabilityRevoked`]: a grant never outlives the
+    /// authority that issued it.
+    pub fn consume_capability(
+        env: Env,
+        caller: Address,
+        capability_id: u64,
+        action: Symbol,
+    ) -> Result<Address, AccessControlError> {
+        caller.require_auth();
+        let key = DataKey::Capability(capability_id);
+        let mut token = env.storage().instance().get::<DataKey, CapabilityToken>(&key)
+            .ok_or(AccessControlError::CapabilityNotFound)?;
+        if token.revoked { return Err(AccessControlError::CapabilityRevoked); }
+        if !Self::is_admin(env.clone(), token.issuer.clone()) {
+            return Err(AccessControlError::CapabilityRevoked);
+        }
+        if token.grantee != caller { return Err(AccessControlError::CapabilityUnauthorized); }
+        if token.action != action { return Err(AccessControlError::CapabilityActionMismatch); }
+        if env.ledger().timestamp() >= token.expires_at { return Err(AccessControlError::CapabilityExpired); }
+        if token.uses >= token.max_uses { return Err(AccessControlError::CapabilityExhausted); }
+        token.uses += 1;
+        env.storage().instance().set(&key, &token);
+        Ok(token.issuer)
+    }
+
+    /// Revoke a capability. The issuer or any admin may revoke it.
+    pub fn revoke_capability(env: Env, caller: Address, capability_id: u64) -> Result<(), AccessControlError> {
+        caller.require_auth();
+        let key = DataKey::Capability(capability_id);
+        let mut token = env.storage().instance().get::<DataKey, CapabilityToken>(&key)
+            .ok_or(AccessControlError::CapabilityNotFound)?;
+        if token.issuer != caller && !Self::is_admin(env.clone(), caller.clone()) {
+            return Err(AccessControlError::CapabilityUnauthorized);
+        }
+        token.revoked = true;
+        env.storage().instance().set(&key, &token);
+        Ok(())
+    }
+
+    /// Read a capability token for audit and recovery tooling.
+    pub fn get_capability(env: Env, capability_id: u64) -> Option<CapabilityToken> {
+        env.storage().instance().get(&DataKey::Capability(capability_id))
+    }
+
     /// Returns the expiration ledger timestamp for `user`'s direct grant of
     /// `role`, if any grant record exists. `None` when no grant has ever
     /// been recorded, or when the recorded grant is permanent
@@ -968,6 +1277,7 @@ impl AccessControlContract {
         // Role-scoped: a maintainer, or a holder of `role`, may invite.
         // The permission matrix owns the escalation check.
         require_action(&env, &caller, &Action::InviteMember(role.clone()))?;
+        require_not_paused(&env, PAUSE_SCOPE_INVITES)?;
 
         // Rate limiting
         let current_time = env.ledger().timestamp();
@@ -1032,6 +1342,8 @@ impl AccessControlContract {
         role: Symbol,
     ) -> Result<(), AccessControlError> {
         caller.require_auth();
+        require_not_paused(&env, PAUSE_SCOPE_INVITES)?;
+        require_not_paused(&env, PAUSE_SCOPE_ROLES)?;
 
         let key = DataKey::Invitation(caller.clone(), role.clone());
         if let Some(inv) = env.storage().instance().get::<DataKey, Invitation>(&key) {
@@ -1079,6 +1391,7 @@ impl AccessControlContract {
                 &caller,
                 &Action::CancelInvitation(inv.inviter.clone()),
             )?;
+            require_not_paused(&env, PAUSE_SCOPE_INVITES)?;
 
             env.storage().instance().remove(&key);
             record_access_audit(
@@ -2383,6 +2696,69 @@ mod tests {
     }
 
     #[test]
+    fn paused_role_scope_rejects_mutation_and_allows_retry_after_resume() {
+        let (env, super_admin, contract_id) = setup();
+        let client = client_for(&env, &contract_id);
+        let role = Symbol::new(&env, "operator");
+        let member = Address::generate(&env);
+        client.create_role(&super_admin, &role);
+
+        client.pause(&super_admin, &symbol_short!("roles"));
+        assert_eq!(
+            client.try_grant_role(&super_admin, &role, &member),
+            Err(Ok(AccessControlError::OperationPaused))
+        );
+        assert!(!client.has_role(&role, &member));
+
+        client.resume(&super_admin, &symbol_short!("roles"));
+        client.grant_role(&super_admin, &role, &member);
+        assert!(client.has_role(&role, &member));
+    }
+
+    #[test]
+    fn pause_scopes_block_only_their_operation_families() {
+        let (env, super_admin, contract_id) = setup();
+        let client = client_for(&env, &contract_id);
+        let role = Symbol::new(&env, "operator");
+        let invitee = Address::generate(&env);
+        client.create_role(&super_admin, &role);
+
+        client.pause(&super_admin, &symbol_short!("invites"));
+        assert_eq!(
+            client.try_create_invitation(&super_admin, &role, &invitee, &600),
+            Err(Ok(AccessControlError::OperationPaused))
+        );
+        client.grant_role(&super_admin, &role, &invitee);
+        assert!(client.has_role(&role, &invitee));
+
+        client.resume(&super_admin, &symbol_short!("invites"));
+        client.pause(&super_admin, &symbol_short!("admins"));
+        let next_admin = Address::generate(&env);
+        assert_eq!(
+            client.try_add_admin(&super_admin, &next_admin),
+            Err(Ok(AccessControlError::OperationPaused))
+        );
+        assert!(!client.is_admin(&next_admin));
+    }
+
+    #[test]
+    fn paused_mutations_still_require_authorization() {
+        let (env, super_admin, contract_id) = setup();
+        let client = client_for(&env, &contract_id);
+        let outsider = Address::generate(&env);
+        let role = Symbol::new(&env, "operator");
+        let member = Address::generate(&env);
+        client.create_role(&super_admin, &role);
+        client.pause(&super_admin, &symbol_short!("roles"));
+
+        assert_eq!(
+            client.try_grant_role(&outsider, &role, &member),
+            Err(Ok(AccessControlError::NotAdmin))
+        );
+        assert!(!client.has_role(&role, &member));
+    }
+
+    #[test]
     fn non_admin_cannot_pause_or_resume() {
         let (env, super_admin, contract_id) = setup();
         let client = client_for(&env, &contract_id);
@@ -2465,6 +2841,177 @@ mod tests {
         assert_eq!(pause.attribute, Some(scope.clone()));
         assert_eq!(pause.before, Some(0));
         assert_eq!(pause.after, Some(1));
+    }
+
+    #[test]
+    fn capability_is_single_use_authorized_and_expiring() {
+        let (env, super_admin, contract_id) = setup();
+        let client = client_for(&env, &contract_id);
+        let grantee = Address::generate(&env);
+        let action = symbol_short!("pause");
+        let id = client.issue_capability(&super_admin, &grantee, &action, &100, &1);
+
+        assert_eq!(client.consume_capability(&grantee, &id, &action), super_admin);
+        assert_eq!(client.try_consume_capability(&grantee, &id, &action), Err(Ok(AccessControlError::CapabilityExhausted)));
+        env.ledger().set_timestamp(101);
+        assert_eq!(client.try_consume_capability(&grantee, &id, &action), Err(Ok(AccessControlError::CapabilityExpired)));
+    }
+
+    #[test]
+    fn capability_rejects_wrong_action_and_can_be_revoked() {
+        let (env, super_admin, contract_id) = setup();
+        let client = client_for(&env, &contract_id);
+        let grantee = Address::generate(&env);
+        let id = client.issue_capability(&super_admin, &grantee, &symbol_short!("pause"), &100, &2);
+        assert_eq!(client.try_consume_capability(&grantee, &id, &symbol_short!("transfer")), Err(Ok(AccessControlError::CapabilityActionMismatch)));
+        client.revoke_capability(&super_admin, &id);
+        assert_eq!(client.try_consume_capability(&grantee, &id, &symbol_short!("pause")), Err(Ok(AccessControlError::CapabilityRevoked)));
+    }
+
+    // -----------------------------------------------------------------------
+    // Expiring capability grants for sensitive actions (Issue #479)
+    // -----------------------------------------------------------------------
+
+    fn uses_of(client: &AccessControlContractClient, id: u64) -> u32 {
+        client.get_capability(&id).unwrap().uses
+    }
+
+    #[test]
+    fn capability_pauses_a_scope_once_without_a_standing_role() {
+        let (env, super_admin, contract_id) = setup();
+        let client = client_for(&env, &contract_id);
+        let operator = Address::generate(&env);
+        let id =
+            client.issue_capability(&super_admin, &operator, &symbol_short!("pause"), &100, &1);
+
+        assert!(!client.is_admin(&operator));
+        client.pause_with_capability(&operator, &PAUSE_SCOPE_ROLES, &id);
+        assert!(client.is_paused(&PAUSE_SCOPE_ROLES));
+        assert_eq!(uses_of(&client, id), 1);
+    }
+
+    #[test]
+    fn capability_expires_exactly_at_expires_at_and_rejects_other_callers() {
+        let (env, super_admin, contract_id) = setup();
+        let client = client_for(&env, &contract_id);
+        let grantee = Address::generate(&env);
+        let stranger = Address::generate(&env);
+        let action = symbol_short!("pause");
+        env.ledger().set_timestamp(1_000);
+        let id = client.issue_capability(&super_admin, &grantee, &action, &100, &2);
+
+        assert_eq!(
+            client.try_consume_capability(&stranger, &id, &action),
+            Err(Ok(AccessControlError::CapabilityUnauthorized))
+        );
+        env.ledger().set_timestamp(1_099);
+        client.consume_capability(&grantee, &id, &action);
+        env.ledger().set_timestamp(1_100);
+        assert_eq!(
+            client.try_consume_capability(&grantee, &id, &action),
+            Err(Ok(AccessControlError::CapabilityExpired))
+        );
+        assert_eq!(uses_of(&client, id), 1);
+    }
+
+    #[test]
+    fn failed_capability_action_rolls_back_the_use_so_it_can_be_retried() {
+        let (env, super_admin, contract_id) = setup();
+        let client = client_for(&env, &contract_id);
+        let operator = Address::generate(&env);
+        let id =
+            client.issue_capability(&super_admin, &operator, &symbol_short!("pause"), &100, &1);
+
+        // Rejected before the capability is touched.
+        assert_eq!(
+            client.try_pause_with_capability(&operator, &symbol_short!("bogus"), &id),
+            Err(Ok(AccessControlError::InvalidPauseScope))
+        );
+        // Consumed, then the pause itself fails: the whole call rolls back.
+        client.pause(&super_admin, &PAUSE_SCOPE_ROLES);
+        assert_eq!(
+            client.try_pause_with_capability(&operator, &PAUSE_SCOPE_ROLES, &id),
+            Err(Ok(AccessControlError::OperationPaused))
+        );
+        assert_eq!(uses_of(&client, id), 0);
+
+        client.resume(&super_admin, &PAUSE_SCOPE_ROLES);
+        client.pause_with_capability(&operator, &PAUSE_SCOPE_ROLES, &id);
+        assert_eq!(uses_of(&client, id), 1);
+    }
+
+    #[test]
+    fn capability_dies_with_its_issuers_admin_role() {
+        let (env, super_admin, contract_id) = setup();
+        let client = client_for(&env, &contract_id);
+        let issuer = Address::generate(&env);
+        let operator = Address::generate(&env);
+        let action = symbol_short!("pause");
+        client.add_admin(&super_admin, &issuer);
+        let id = client.issue_capability(&issuer, &operator, &action, &100, &5);
+        client.consume_capability(&operator, &id, &action);
+
+        client.remove_admin(&super_admin, &issuer);
+        assert_eq!(
+            client.try_consume_capability(&operator, &id, &action),
+            Err(Ok(AccessControlError::CapabilityRevoked))
+        );
+        assert_eq!(
+            client.try_pause_with_capability(&operator, &PAUSE_SCOPE_ROLES, &id),
+            Err(Ok(AccessControlError::CapabilityRevoked))
+        );
+        assert!(!client.is_paused(&PAUSE_SCOPE_ROLES));
+
+        // Recovery: a current admin issues a fresh capability.
+        let fresh = client.issue_capability(&super_admin, &operator, &action, &100, &1);
+        client.pause_with_capability(&operator, &PAUSE_SCOPE_ROLES, &fresh);
+        assert!(client.is_paused(&PAUSE_SCOPE_ROLES));
+    }
+
+    #[test]
+    fn emergency_lockdown_requires_two_distinct_admins_and_supports_cancel_and_expiry() {
+        let (env, admin_a, contract_id) = setup();
+        let client = client_for(&env, &contract_id);
+        let admin_b = Address::generate(&env);
+        client.add_admin(&admin_a, &admin_b);
+
+        env.ledger().set_timestamp(100);
+        client.request_emergency_lockdown(&admin_a, &10);
+        assert_eq!(
+            client.try_confirm_emergency_lockdown(&admin_a),
+            Err(Ok(AccessControlError::LockdownApproverMustDiffer))
+        );
+        env.ledger().set_timestamp(111);
+        assert_eq!(
+            client.try_confirm_emergency_lockdown(&admin_b),
+            Err(Ok(AccessControlError::LockdownExpired))
+        );
+        client.request_emergency_lockdown(&admin_a, &100);
+        client.cancel_emergency_lockdown(&admin_a);
+        assert!(!client.is_emergency_locked());
+    }
+
+    #[test]
+    fn emergency_lockdown_blocks_mutations_until_two_admin_unlock() {
+        let (env, admin_a, contract_id) = setup();
+        let client = client_for(&env, &contract_id);
+        let admin_b = Address::generate(&env);
+        let role = symbol_short!("operator");
+        client.add_admin(&admin_a, &admin_b);
+        client.request_emergency_lockdown(&admin_a, &100);
+        client.confirm_emergency_lockdown(&admin_b);
+        assert!(client.is_emergency_locked());
+        assert_eq!(
+            client.try_create_role(&admin_a, &role),
+            Err(Ok(AccessControlError::OperationPaused))
+        );
+        assert_eq!(
+            client.try_unlock_emergency_lockdown(&admin_a, &admin_a),
+            Err(Ok(AccessControlError::LockdownApproverMustDiffer))
+        );
+        client.unlock_emergency_lockdown(&admin_a, &admin_b);
+        client.create_role(&admin_a, &role);
+        assert!(!client.is_emergency_locked());
     }
 
 }

@@ -25,8 +25,8 @@ extern crate alloc;
 extern crate std;
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token, Address, Bytes, BytesN, Env, Map, Symbol,
-    Vec,
+    contract, contractimpl, contracttype, symbol_short, token, Address, Bytes, BytesN, Env, Map,
+    Symbol, Vec,
 };
 
 pub mod storage;
@@ -405,7 +405,9 @@ fn update_collection_stats(
     listing_delta: i32,
     auction_delta: i32,
 ) {
-    if let Some(mut info) = persistent_get::<DataKey, CollectionInfo>(env, &DataKey::CollectionInfo(collection.clone())) {
+    if let Some(mut info) =
+        persistent_get::<DataKey, CollectionInfo>(env, &DataKey::CollectionInfo(collection.clone()))
+    {
         if listing_delta > 0 {
             info.active_listings += listing_delta as u32;
         } else if listing_delta < 0 && info.active_listings > 0 {
@@ -625,6 +627,70 @@ impl NftMarketplace {
         Ok(())
     }
 
+    // -----------------------------------------------------------------------
+    // Collection metadata allow-list (Issue #277)
+    //
+    // `register_collection` only accepts `ipfs_uri` values matching a safe
+    // *scheme* (see `shared::sanitize::validate_external_url`). These
+    // entrypoints let the admin additionally restrict which *hosts* and
+    // *file extensions* are accepted, once populated. An empty/unenforced
+    // list is a no-op, so existing collections and deployments are
+    // unaffected. See `docs/ALLOWLIST_VALIDATION.md` for rollback guidance.
+    // -----------------------------------------------------------------------
+
+    pub fn add_allowed_metadata_host(
+        env: Env,
+        caller: Address,
+        host: Bytes,
+    ) -> Result<(), MarketError> {
+        // `shared::allowlist::add_allowed_host` already enforces
+        // `Permission::ManageConfiguration` internally; a second local
+        // `require_admin` pre-check here would call `caller.require_auth()`
+        // twice for the same invocation, which the host rejects.
+        shared::allowlist::add_allowed_host(&env, &caller, host).map_err(map_allowlist_error)?;
+        emit_action(&env, &caller, symbol_short!("aml_host"));
+        Ok(())
+    }
+
+    pub fn remove_allowed_metadata_host(
+        env: Env,
+        caller: Address,
+        host: Bytes,
+    ) -> Result<(), MarketError> {
+        shared::allowlist::remove_allowed_host(&env, &caller, host).map_err(map_allowlist_error)?;
+        emit_action(&env, &caller, symbol_short!("rml_host"));
+        Ok(())
+    }
+
+    pub fn add_allowed_metadata_ext(
+        env: Env,
+        caller: Address,
+        extension: Bytes,
+    ) -> Result<(), MarketError> {
+        shared::allowlist::add_allowed_extension(&env, &caller, extension)
+            .map_err(map_allowlist_error)?;
+        emit_action(&env, &caller, symbol_short!("aml_ext"));
+        Ok(())
+    }
+
+    pub fn remove_allowed_metadata_ext(
+        env: Env,
+        caller: Address,
+        extension: Bytes,
+    ) -> Result<(), MarketError> {
+        shared::allowlist::remove_allowed_extension(&env, &caller, extension)
+            .map_err(map_allowlist_error)?;
+        emit_action(&env, &caller, symbol_short!("rml_ext"));
+        Ok(())
+    }
+
+    /// Read-only check callers can use to validate a candidate `ipfs_uri`
+    /// before submitting `register_collection`, e.g. after a prior
+    /// submission was rejected and the allow-list has since been updated.
+    pub fn is_metadata_url_allowed(env: Env, ipfs_uri: Bytes) -> bool {
+        shared::allowlist::validate_url(&env, &ipfs_uri).is_ok()
+    }
+
     pub fn platform_fee_bps(env: Env) -> i128 {
         instance_get(&env, &KEY_PLATFORM_FEE_BPS).unwrap_or(DEFAULT_PLATFORM_FEE_BPS)
     }
@@ -675,6 +741,12 @@ impl NftMarketplace {
             return Err(MarketError::InvalidMetadataHash);
         }
         shared::sanitize::validate_external_url(&ipfs_uri, shared::sanitize::MAX_URL_LEN, false)
+            .map_err(|_| MarketError::InvalidArgument)?;
+        // Issue #277: once an admin has populated the metadata allow-list
+        // (see `add_allowed_metadata_host` / `add_allowed_metadata_ext`),
+        // only those hosts/extensions are accepted. Until then this is a
+        // no-op, so existing collections and deployments are unaffected.
+        shared::allowlist::validate_url(&env, &ipfs_uri)
             .map_err(|_| MarketError::InvalidArgument)?;
 
         if royalty_recipients.len() > MAX_ROYALTY_RECIPIENTS {
@@ -1427,7 +1499,15 @@ impl NftMarketplace {
 
         persistent_set(&env, &offer_key(offer_id), &offer);
         let cid = default_correlation_id(&env);
-        events::emit_nft_offer(&env, &cid, offer_id, &offerer, token_id, offer_amount, expires_at);
+        events::emit_nft_offer(
+            &env,
+            &cid,
+            offer_id,
+            &offerer,
+            token_id,
+            offer_amount,
+            expires_at,
+        );
         Ok(offer_id)
     }
 
@@ -1701,6 +1781,15 @@ fn require_not_paused(env: &Env) -> MktResult<()> {
     Ok(())
 }
 
+/// Maps the shared allow-list module's error taxonomy (Issue #277) onto this
+/// contract's local error codes.
+fn map_allowlist_error(error: shared::allowlist::AllowlistError) -> MarketError {
+    match error {
+        shared::allowlist::AllowlistError::Unauthorized => MarketError::Unauthorized,
+        _ => MarketError::InvalidArgument,
+    }
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -1864,6 +1953,134 @@ mod tests {
                 &Vec::new(&m.env),
             ),
             Err(Ok(MarketError::CollectionAlreadyRegistered))
+        );
+    }
+
+    // ── Metadata allow-list (Issue #277) ─────────────────────────────
+
+    #[test]
+    fn metadata_host_allowlist_normal_and_rejection_paths() {
+        let m = setup();
+        init(&m);
+        let c = client(&m);
+
+        // Admin opts a single host into the allow-list. Collections already
+        // registered (via `init`, using `ipfs://QmTest`) are unaffected.
+        c.add_allowed_metadata_host(&m.admin, &Bytes::from_slice(&m.env, b"ipfs.io"));
+        assert_eq!(c.get_collection(&m.nft_collection).admin, m.admin);
+
+        // Normal path: a host on the list is accepted.
+        let allowed_collection = Address::generate(&m.env);
+        c.register_collection(
+            &m.admin,
+            &allowed_collection,
+            &Symbol::new(&m.env, "Allowed"),
+            &Bytes::from_slice(&m.env, b"https://ipfs.io/ipfs/CID/metadata.json"),
+            &mk_hash(&m.env),
+            &TokenStandard::ERC721,
+            &Vec::new(&m.env),
+        );
+        assert_eq!(c.get_collection(&allowed_collection).admin, m.admin);
+
+        // Rejection path: a host that was never allow-listed is refused,
+        // even though it passes the baseline scheme/byte safety check.
+        let rejected_collection = Address::generate(&m.env);
+        assert_eq!(
+            c.try_register_collection(
+                &m.admin,
+                &rejected_collection,
+                &Symbol::new(&m.env, "Rejected"),
+                &Bytes::from_slice(&m.env, b"https://evil.example/metadata.json"),
+                &mk_hash(&m.env),
+                &TokenStandard::ERC721,
+                &Vec::new(&m.env),
+            ),
+            Err(Ok(MarketError::InvalidArgument))
+        );
+        assert!(c.try_get_collection(&rejected_collection).is_err());
+    }
+
+    #[test]
+    fn metadata_host_allowlist_retry_succeeds_after_admin_update() {
+        let m = setup();
+        init(&m);
+        let c = client(&m);
+        c.add_allowed_metadata_host(&m.admin, &Bytes::from_slice(&m.env, b"ipfs.io"));
+
+        let collection = Address::generate(&m.env);
+        let uri = Bytes::from_slice(&m.env, b"https://gateway.pinata.cloud/ipfs/CID");
+
+        // First submission is rejected: this host is not yet on the list.
+        assert_eq!(
+            c.try_register_collection(
+                &m.admin,
+                &collection,
+                &Symbol::new(&m.env, "Retry"),
+                &uri,
+                &mk_hash(&m.env),
+                &TokenStandard::ERC721,
+                &Vec::new(&m.env),
+            ),
+            Err(Ok(MarketError::InvalidArgument))
+        );
+        assert!(!c.is_metadata_url_allowed(&uri));
+
+        // Admin updates the allow-list to include the new gateway.
+        c.add_allowed_metadata_host(
+            &m.admin,
+            &Bytes::from_slice(&m.env, b"gateway.pinata.cloud"),
+        );
+        assert!(c.is_metadata_url_allowed(&uri));
+
+        // Resubmitting the exact same request now succeeds.
+        c.register_collection(
+            &m.admin,
+            &collection,
+            &Symbol::new(&m.env, "Retry"),
+            &uri,
+            &mk_hash(&m.env),
+            &TokenStandard::ERC721,
+            &Vec::new(&m.env),
+        );
+        assert_eq!(c.get_collection(&collection).admin, m.admin);
+    }
+
+    #[test]
+    fn metadata_allowlist_mutation_requires_admin() {
+        let m = setup();
+        init(&m);
+        let c = client(&m);
+        let stranger = fresh_user(&m);
+
+        assert_eq!(
+            c.try_add_allowed_metadata_host(&stranger, &Bytes::from_slice(&m.env, b"ipfs.io")),
+            Err(Ok(MarketError::Unauthorized))
+        );
+        assert_eq!(
+            c.try_add_allowed_metadata_ext(&stranger, &Bytes::from_slice(&m.env, b"json")),
+            Err(Ok(MarketError::Unauthorized))
+        );
+        assert_eq!(
+            c.try_remove_allowed_metadata_host(&stranger, &Bytes::from_slice(&m.env, b"ipfs.io")),
+            Err(Ok(MarketError::Unauthorized))
+        );
+        // None of the stranger's rejected attempts had any side effect: the
+        // host dimension is still unconfigured, so every URL still
+        // pass-through validates, including one the stranger never named.
+        assert!(c.is_metadata_url_allowed(&Bytes::from_slice(
+            &m.env,
+            b"https://still-unconfigured.example/metadata.json"
+        )));
+
+        // The admin can do what the stranger could not.
+        c.add_allowed_metadata_host(&m.admin, &Bytes::from_slice(&m.env, b"ipfs.io"));
+        // Enforcement is now on for every host, not just the one just added.
+        assert!(!c.is_metadata_url_allowed(&Bytes::from_slice(
+            &m.env,
+            b"https://still-unconfigured.example/metadata.json"
+        )));
+        assert!(
+            c.is_metadata_url_allowed(&Bytes::from_slice(&m.env, b"https://ipfs.io/metadata.json"))
         );
     }
 
@@ -2733,4 +2950,3 @@ mod tests {
         }
     }
 }
-

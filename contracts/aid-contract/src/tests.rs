@@ -767,6 +767,22 @@ fn test_stable_cursor_pagination_on_aid_contract() {
 }
 
 #[test]
+fn owner_pagination_respects_bounds_and_filtering() {
+    let fx = setup();
+    let client = AidContractClient::new(&fx.env, &fx.contract_id);
+    let expiry = fx.env.ledger().sequence() + 1000;
+    let first = client.create_aid(&fx.donor, &fx.recipient, &100, &expiry, &None);
+    let second = client.create_aid(&fx.donor, &fx.recipient, &200, &expiry, &None);
+    let page = client.list_aids_by_donor_cursor(&fx.donor, &None, &1);
+    assert_eq!(page.records.len(), 1);
+    assert_eq!(page.records.get(0).unwrap().id, first);
+    assert_eq!(page.next_cursor, Some(first));
+    let next = client.list_aids_by_donor_cursor(&fx.donor, &page.next_cursor, &1);
+    assert_eq!(next.records.len(), 1);
+    assert_eq!(next.records.get(0).unwrap().id, second);
+}
+
+#[test]
 fn test_cursor_pagination_under_inserts_deletes_and_permission_changes() {
     let fx = setup();
     let client = AidContractClient::new(&fx.env, &fx.contract_id);
@@ -1619,3 +1635,133 @@ fn test_stress_bucketed_pagination_no_unbounded_vectors() {
     });
 }
 
+
+// ---------------------------------------------------------------------------
+// Request correlation IDs (Issue #476)
+// ---------------------------------------------------------------------------
+
+/// Correlation ID carried by the latest event published under `topic`. Every
+/// aid lifecycle event puts the ID last in its data tuple.
+fn last_correlation(env: &Env, topic: Symbol) -> Option<Bytes> {
+    use soroban_sdk::{testutils::Events as _, IntoVal, TryFromVal, Val};
+    let topics: Vec<Val> = (topic,).into_val(env);
+    let (_, _, data) = env
+        .events()
+        .all()
+        .iter()
+        .filter(|(_, t, _)| *t == topics)
+        .last()
+        .expect("event not published");
+    let fields = Vec::<Val>::try_from_val(env, &data).unwrap();
+    Option::<Bytes>::try_from_val(env, &fields.last().unwrap()).unwrap()
+}
+
+fn stored_correlation(fx: &Fixture, aid_id: u64) -> Option<Bytes> {
+    fx.env
+        .as_contract(&fx.contract_id, || correlation::load(&fx.env, aid_id))
+}
+
+#[test]
+fn correlation_id_follows_aid_from_create_through_claim_and_settle() {
+    let fx = setup();
+    let client = AidContractClient::new(&fx.env, &fx.contract_id);
+    let cid = Bytes::from_slice(&fx.env, b"req-7f3a9c2e-claim-flow");
+    let expiry = fx.env.ledger().sequence() + 100;
+
+    let aid_id = client.create_aid(&fx.donor, &fx.recipient, &500, &expiry, &Some(cid.clone()));
+    assert_eq!(last_correlation(&fx.env, AID_CREATED), Some(cid.clone()));
+
+    client.claim_aid(&aid_id, &fx.recipient);
+    assert_eq!(last_correlation(&fx.env, AID_CLAIMED), Some(cid.clone()));
+    assert_eq!(last_correlation(&fx.env, AID_SETTLED), Some(cid));
+}
+
+#[test]
+fn oversized_correlation_id_is_rejected_before_any_state_change() {
+    let fx = setup();
+    let client = AidContractClient::new(&fx.env, &fx.contract_id);
+    let balances = token::Client::new(&fx.env, &fx.token_addr);
+    let expiry = fx.env.ledger().sequence() + 100;
+    let counter_before = fx
+        .env
+        .as_contract(&fx.contract_id, || get_aid_counter(&fx.env));
+
+    // One byte over CORRELATION_ID_MAX_LEN (64).
+    let too_long = Bytes::from_slice(&fx.env, &[b'a'; 65]);
+    assert_eq!(
+        client.try_create_aid(&fx.donor, &fx.recipient, &500, &expiry, &Some(too_long)),
+        Err(Ok(soroban_sdk::Error::from_contract_error(
+            AidError::InvalidCorrelationId as u32
+        )))
+    );
+    assert_eq!(balances.balance(&fx.donor), MINT_AMOUNT);
+    assert_eq!(
+        fx.env
+            .as_contract(&fx.contract_id, || get_aid_counter(&fx.env)),
+        counter_before
+    );
+
+    // Exactly 64 bytes is accepted; an empty ID still means "no correlation".
+    let at_limit = Bytes::from_slice(&fx.env, &[b'a'; 64]);
+    let kept = client.create_aid(
+        &fx.donor,
+        &fx.recipient,
+        &500,
+        &expiry,
+        &Some(at_limit.clone()),
+    );
+    assert_eq!(stored_correlation(&fx, kept), Some(at_limit));
+    let empty = client.create_aid(
+        &fx.donor,
+        &fx.recipient,
+        &500,
+        &expiry,
+        &Some(Bytes::new(&fx.env)),
+    );
+    assert_eq!(stored_correlation(&fx, empty), None);
+}
+
+#[test]
+fn retried_claim_after_a_failed_attempt_keeps_the_original_correlation_id() {
+    let fx = setup();
+    let client = AidContractClient::new(&fx.env, &fx.contract_id);
+    let cid = Bytes::from_slice(&fx.env, b"req-retry-after-pause");
+    let expiry = fx.env.ledger().sequence() + 100;
+    let aid_id = client.create_aid(&fx.donor, &fx.recipient, &500, &expiry, &Some(cid.clone()));
+
+    client.set_paused(&fx.admin, &true);
+    assert_eq!(
+        client.try_claim_aid(&aid_id, &fx.recipient),
+        Err(Ok(AidError::Paused))
+    );
+    // The failed attempt changed nothing, so the retry needs no new ID.
+    assert_eq!(stored_correlation(&fx, aid_id), Some(cid.clone()));
+
+    client.set_paused(&fx.admin, &false);
+    client.claim_aid(&aid_id, &fx.recipient);
+    assert_eq!(last_correlation(&fx.env, AID_CLAIMED), Some(cid));
+}
+
+#[test]
+fn unauthorized_claim_and_refund_leave_the_correlation_id_untouched() {
+    let fx = setup();
+    let client = AidContractClient::new(&fx.env, &fx.contract_id);
+    let stranger = Address::generate(&fx.env);
+    let cid = Bytes::from_slice(&fx.env, b"req-refund-flow");
+    let expiry = fx.env.ledger().sequence() + 10;
+    let aid_id = client.create_aid(&fx.donor, &fx.recipient, &500, &expiry, &Some(cid.clone()));
+
+    assert_eq!(
+        client.try_claim_aid(&aid_id, &stranger),
+        Err(Ok(AidError::Unauthorized))
+    );
+    advance_ledger(&fx.env, 11);
+    assert_eq!(
+        client.try_refund_aid(&aid_id, &stranger),
+        Err(Ok(AidError::Unauthorized))
+    );
+    assert_eq!(stored_correlation(&fx, aid_id), Some(cid.clone()));
+
+    client.refund_aid(&aid_id, &fx.donor);
+    assert_eq!(last_correlation(&fx.env, AID_REFUNDED), Some(cid));
+}

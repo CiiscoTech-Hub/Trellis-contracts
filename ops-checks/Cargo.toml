@@ -1,0 +1,25 @@
+[package]
+name = "ops-checks"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+description = "Synthetic journey monitoring and executable incident recovery checks (Issues #451, #452)"
+
+# Off-chain operational tooling: runs the real aid contract inside a local
+# soroban `Env` (testutils), so it is never compiled to wasm or deployed.
+# Kept separate from the `testing` crate so these checks build and run on
+# their own and do not depend on every test harness compiling.
+
+[dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+shared = { workspace = true }
+aid-contract = { path = "../contracts/aid-contract" }
+
+[[bin]]
+name = "high-value-journey-monitor"
+path = "src/bin/high_value_journey_monitor.rs"
+
+[[bin]]
+name = "incident-runbook-checks"
+path = "src/bin/incident_runbook_checks.rs"

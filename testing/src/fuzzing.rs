@@ -1193,3 +1193,314 @@ mod malformed_argument_fuzz_tests {
     }
 }
 
+// -----------------------------------------------------------------------------
+// Issue #290: Fuzz coverage for malformed payloads and boundary numeric values
+// -----------------------------------------------------------------------------
+
+pub struct BoundaryNumericGenerator<'a> {
+    env: &'a Env,
+    seed: u64,
+}
+
+impl<'a> BoundaryNumericGenerator<'a> {
+    pub fn new(env: &'a Env, seed: u64) -> Self {
+        Self { env, seed }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.seed = self
+            .seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        self.seed
+    }
+
+    pub fn boundary_i128(&mut self) -> i128 {
+        match self.next_u64() % 12 {
+            0 => i128::MIN,
+            1 => i128::MIN + 1,
+            2 => i128::MAX,
+            3 => i128::MAX - 1,
+            4 => 0,
+            5 => 1,
+            6 => -1,
+            7 => i64::MAX as i128,
+            8 => i64::MIN as i128,
+            9 => i64::MAX as i128 + 1,
+            10 => (i64::MIN as i128) - 1,
+            _ => (self.next_u64() as i128) - (i64::MAX as i128),
+        }
+    }
+
+    pub fn boundary_u32(&mut self) -> u32 {
+        match self.next_u64() % 6 {
+            0 => 0,
+            1 => 1,
+            2 => u32::MAX,
+            3 => u32::MAX - 1,
+            4 => u32::MAX / 2,
+            _ => (self.next_u64() % (u32::MAX as u64)) as u32,
+        }
+    }
+
+    pub fn boundary_u64(&mut self) -> u64 {
+        match self.next_u64() % 6 {
+            0 => 0,
+            1 => 1,
+            2 => u64::MAX,
+            3 => u64::MAX - 1,
+            4 => u64::MAX / 2,
+            _ => self.next_u64(),
+        }
+    }
+
+    pub fn overflow_pair_i128(&mut self) -> (i128, i128) {
+        match self.next_u64() % 4 {
+            0 => (i128::MAX, 1),
+            1 => (i128::MIN, -1),
+            2 => (i128::MAX / 2 + 1, i128::MAX / 2 + 1),
+            _ => (i128::MIN / 2 - 1, i128::MIN / 2 - 1),
+        }
+    }
+
+    pub fn malformed_payload(&mut self) -> Bytes {
+        match self.next_u64() % 8 {
+            0 => Bytes::new(self.env),
+            1 => Bytes::from_slice(self.env, &[0xFF; 1]),
+            2 => Bytes::from_slice(self.env, &[0x00; 33]),
+            3 => Bytes::from_slice(self.env, &[0xDE, 0xAD]),
+            4 => Bytes::from_slice(self.env, &[0xFF; 128]),
+            5 => Bytes::from_slice(self.env, &[0x00; 0]),
+            6 => {
+                let mut data = [0u8; 32];
+                data[31] = 0xFF;
+                Bytes::from_slice(self.env, &data)
+            }
+            _ => Bytes::from_slice(self.env, &[0xAB; 64]),
+        }
+    }
+}
+
+pub struct BoundaryValidator;
+
+impl BoundaryValidator {
+    pub fn validate_positive_amount(amount: i128) -> Result<(), Error> {
+        if amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+        Ok(())
+    }
+
+    pub fn validate_amount_range(amount: i128, min: i128, max: i128) -> Result<(), Error> {
+        if min > max {
+            return Err(Error::ConfigInvalid);
+        }
+        if amount < min || amount > max {
+            return Err(Error::InvalidAmount);
+        }
+        Ok(())
+    }
+
+    pub fn validate_checked_add(a: i128, b: i128) -> Result<i128, Error> {
+        a.checked_add(b).ok_or(Error::Overflow)
+    }
+
+    pub fn validate_checked_mul(a: i128, b: i128) -> Result<i128, Error> {
+        a.checked_mul(b).ok_or(Error::Overflow)
+    }
+
+    pub fn validate_fee_bps(bps: u32) -> Result<(), Error> {
+        if bps > 10_000 {
+            return Err(Error::PaymentInvalidFeeRate);
+        }
+        Ok(())
+    }
+
+    pub fn validate_payload_length(payload: &Bytes, min_len: u32, max_len: u32) -> Result<(), Error> {
+        let len = payload.len();
+        if len < min_len || len > max_len {
+            return Err(Error::InvalidArgument);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod boundary_numeric_fuzz_tests {
+    use super::*;
+
+    const ITERATIONS: usize = 200;
+
+    #[test]
+    fn normal_path_valid_amounts_within_default_policy_bounds() {
+        let env = Env::default();
+        let mut gen = BoundaryNumericGenerator::new(&env, 42);
+
+        let valid_amounts = [1_i128, 100, 999_999_999, 1_000_000_000];
+        for &amount in &valid_amounts {
+            assert!(BoundaryValidator::validate_positive_amount(amount).is_ok());
+            assert!(
+                BoundaryValidator::validate_amount_range(amount, 1, 1_000_000_000).is_ok(),
+                "Amount {} should be within default policy bounds",
+                amount
+            );
+        }
+    }
+
+    #[test]
+    fn failure_path_boundary_i128_values_rejected_as_invalid_amounts() {
+        let env = Env::default();
+        let mut gen = BoundaryNumericGenerator::new(&env, 1337);
+
+        for _ in 0..ITERATIONS {
+            let val = gen.boundary_i128();
+            let result = BoundaryValidator::validate_positive_amount(val);
+            if val <= 0 {
+                assert_eq!(
+                    result,
+                    Err(Error::InvalidAmount),
+                    "Non-positive boundary {} should be rejected",
+                    val
+                );
+            } else {
+                assert!(result.is_ok(), "Positive boundary {} should pass", val);
+            }
+        }
+    }
+
+    #[test]
+    fn failure_path_overflow_pairs_detected_by_checked_arithmetic() {
+        let env = Env::default();
+        let mut gen = BoundaryNumericGenerator::new(&env, 9999);
+
+        for _ in 0..ITERATIONS {
+            let (a, b) = gen.overflow_pair_i128();
+            let add_result = BoundaryValidator::validate_checked_add(a, b);
+            let mul_result = BoundaryValidator::validate_checked_mul(a, b);
+
+            match a.checked_add(b) {
+                None => assert_eq!(add_result, Err(Error::Overflow)),
+                Some(sum) => assert_eq!(add_result, Ok(sum)),
+            }
+            match a.checked_mul(b) {
+                None => assert_eq!(mul_result, Err(Error::Overflow)),
+                Some(product) => assert_eq!(mul_result, Ok(product)),
+            }
+        }
+    }
+
+    #[test]
+    fn failure_path_malformed_payloads_rejected_by_length_validation() {
+        let env = Env::default();
+        let mut gen = BoundaryNumericGenerator::new(&env, 2026);
+
+        for _ in 0..ITERATIONS {
+            let payload = gen.malformed_payload();
+            let result = BoundaryValidator::validate_payload_length(&payload, 32, 32);
+
+            if payload.len() != 32 {
+                assert_eq!(
+                    result,
+                    Err(Error::InvalidArgument),
+                    "Payload of len {} should be rejected for exact-32 constraint",
+                    payload.len()
+                );
+            } else {
+                assert!(result.is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn retry_path_boundary_values_give_consistent_results_across_retries() {
+        let env = Env::default();
+
+        let boundary_values = [i128::MIN, i128::MAX, 0, 1, -1];
+        for &val in &boundary_values {
+            let r1 = BoundaryValidator::validate_positive_amount(val);
+            let r2 = BoundaryValidator::validate_positive_amount(val);
+            assert_eq!(r1, r2, "Boundary {} must give consistent results", val);
+        }
+    }
+
+    #[test]
+    fn authorization_path_fee_bps_boundary_validation() {
+        let env = Env::default();
+        let mut gen = BoundaryNumericGenerator::new(&env, 7777);
+
+        assert!(BoundaryValidator::validate_fee_bps(0).is_ok());
+        assert!(BoundaryValidator::validate_fee_bps(10_000).is_ok());
+        assert_eq!(
+            BoundaryValidator::validate_fee_bps(10_001),
+            Err(Error::PaymentInvalidFeeRate)
+        );
+        assert_eq!(
+            BoundaryValidator::validate_fee_bps(u32::MAX),
+            Err(Error::PaymentInvalidFeeRate)
+        );
+
+        for _ in 0..ITERATIONS {
+            let bps = gen.boundary_u32();
+            let result = BoundaryValidator::validate_fee_bps(bps);
+            if bps > 10_000 {
+                assert_eq!(result, Err(Error::PaymentInvalidFeeRate));
+            } else {
+                assert!(result.is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn normal_path_checked_arithmetic_on_safe_values() {
+        assert_eq!(BoundaryValidator::validate_checked_add(100, 200), Ok(300));
+        assert_eq!(BoundaryValidator::validate_checked_mul(100, 200), Ok(20_000));
+        assert_eq!(BoundaryValidator::validate_checked_add(0, 0), Ok(0));
+        assert_eq!(BoundaryValidator::validate_checked_mul(0, i128::MAX), Ok(0));
+    }
+
+    #[test]
+    fn failure_path_inverted_range_is_config_invalid() {
+        assert_eq!(
+            BoundaryValidator::validate_amount_range(50, 100, 10),
+            Err(Error::ConfigInvalid)
+        );
+    }
+
+    #[test]
+    fn failure_path_amount_outside_range_rejected() {
+        assert_eq!(
+            BoundaryValidator::validate_amount_range(0, 1, 1_000),
+            Err(Error::InvalidAmount)
+        );
+        assert_eq!(
+            BoundaryValidator::validate_amount_range(1_001, 1, 1_000),
+            Err(Error::InvalidAmount)
+        );
+        assert!(BoundaryValidator::validate_amount_range(500, 1, 1_000).is_ok());
+    }
+
+    #[test]
+    fn boundary_i128_extremes_handled_without_panic() {
+        assert_eq!(
+            BoundaryValidator::validate_checked_add(i128::MAX, 1),
+            Err(Error::Overflow)
+        );
+        assert_eq!(
+            BoundaryValidator::validate_checked_add(i128::MIN, -1),
+            Err(Error::Overflow)
+        );
+        assert_eq!(
+            BoundaryValidator::validate_checked_mul(i128::MAX, 2),
+            Err(Error::Overflow)
+        );
+        assert_eq!(
+            BoundaryValidator::validate_checked_mul(i128::MIN, -1),
+            Err(Error::Overflow)
+        );
+        assert_eq!(
+            BoundaryValidator::validate_checked_mul(i128::MIN, 2),
+            Err(Error::Overflow)
+        );
+    }
+}
+

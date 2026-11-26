@@ -129,7 +129,41 @@ cargo test invariants_test
 
 ---
 
-## 7. Runtime Transition Checks in the Aid Contract (Issue #266)
+## 7. Executable Domain Consistency Invariants
+
+The Soroban contract test modules below exercise domain state through their
+public clients and ledger environment. Each test checks a valid transition,
+rejects an invalid mutation, or both; the mutation tests also prove the
+conservation verifier detects deliberately corrupted snapshots.
+
+| Invariant | Why it matters | Contract path and executable test |
+|---|---|---|
+| An aid creation debits the donor and records an equally backed pending liability. | Prevents phantom aid obligations and unbacked escrow. | [`create_aid`](../contracts/aid-contract/src/lib.rs), [`test_invariant_create_aid_conserves_assets`](../contracts/aid-contract/src/invariants_test.rs) |
+| Aid settlement transfers the escrow once and clears the pending liability. | Prevents double payment and stuck liabilities. | [`claim_aid`](../contracts/aid-contract/src/lib.rs), [`test_invariant_claim_aid_settlement_conserves_assets`](../contracts/aid-contract/src/invariants_test.rs), [`test_threat_double_claim_rejected_and_conserves_assets`](../contracts/aid-contract/src/invariants_test.rs) |
+| A refunded aid cannot later be claimed, and a settled aid cannot be refunded. | Keeps terminal lifecycle states mutually exclusive. | [`refund_aid`](../contracts/aid-contract/src/lib.rs), [`test_threat_claim_after_refund_rejected`](../contracts/aid-contract/src/invariants_test.rs), [`test_threat_refund_after_claim_rejected`](../contracts/aid-contract/src/invariants_test.rs) |
+| Only the donor may reclaim expired aid. | Stops unrelated callers from redirecting escrow on cancellation. | [`refund_aid`](../contracts/aid-contract/src/lib.rs), [`test_threat_unauthorized_refund_by_non_donor_rejected`](../contracts/aid-contract/src/invariants_test.rs) |
+| Milestone tranches sum to the escrowed amount and status reflects remaining entitlement. | Prevents one aid record from consuming another record's assets. | [`settle_milestones`](../contracts/aid-contract/src/transitions.rs), [`milestone_claims_track_entitlement_until_settled`](../contracts/aid-contract/src/transitions.rs) |
+| Milestone verification, claims, and refunds require their designated actors. | Prevents unauthorized movement of individual entitlements. | [`only_owners_can_move_entitlements`](../contracts/aid-contract/src/transitions.rs) |
+| Deposits and fee-bearing withdrawals conserve the complete token amount. | Ensures fees plus net proceeds equal the amount removed from contract accounting. | [`deposit`](../contracts/payments-contract/src/lib.rs), [`withdraw_amount`](../contracts/payments-contract/src/lib.rs), [`test_invariant_partial_withdrawal_conserves_assets`](../contracts/payments-contract/src/invariants_test.rs) |
+| Escrow release and cancellation pay only the beneficiary or depositor and clear escrow once. | Prevents incorrect ownership and repeated settlement. | [`release_escrow_entry`](../contracts/payments-contract/src/lib.rs), [`refund_escrow_entry`](../contracts/payments-contract/src/lib.rs), [`test_invariant_escrow_settlement_lifecycle_conserves_assets`](../contracts/payments-contract/src/invariants_test.rs), [`test_invariant_escrow_cancellation_refund_conserves_assets`](../contracts/payments-contract/src/invariants_test.rs) |
+| Batch payouts cannot create or destroy assets. | Keeps aggregate recipient credits equal to the contract debit. | [`batch_payout`](../contracts/payments-contract/src/lib.rs), [`test_invariant_batch_payout_conserves_assets`](../contracts/payments-contract/src/invariants_test.rs) |
+| Treasury category balances remain segregated and cannot be overdrawn. | Stops one category or reward pool from spending another category's allocation. | [`category_balance`](../contracts/treasury-contract/src/lib.rs), [`test_invariant_multi_category_segregation_conserves_assets`](../contracts/treasury-contract/src/invariants_test.rs), [`test_threat_referral_overdraft_cannot_underflow_rewards_category`](../contracts/treasury-contract/src/invariants_test.rs) |
+| Scheduled withdrawals follow their lifecycle and rejected calls leave state unchanged. | Prevents early/replayed withdrawals and partial state updates on failure. | [`execute_scheduled_withdraw`](../contracts/treasury-contract/src/lib.rs), [`test_invariant_scheduled_withdrawal_lifecycle_conserves_state`](../contracts/treasury-contract/src/invariants_test.rs), [`test_invariant_treasury_failure_paths_preserve_exact_state`](../contracts/treasury-contract/src/invariants_test.rs) |
+| Invalid balances and unbacked liabilities are detected by the invariant verifier. | Demonstrates that impossible states fail assertions rather than silently passing. | [`verify_conservation`](../shared/src/invariants.rs), [`test_mutation_impossible_balances_fail_invariant_verification`](../contracts/payments-contract/src/invariants_test.rs) |
+
+These modules are included by their contract crates under `cfg(test)`. Run
+the targeted suites locally with:
+
+```bash
+cargo test -p aid-contract invariants_test
+cargo test -p payments-contract invariants_test
+cargo test -p treasury-contract invariants_test
+cargo test -p aid-contract transitions
+```
+
+---
+
+## 8. Runtime Transition Checks in the Aid Contract (Issue #266)
 
 The suites above check invariants from outside, after a call. The aid
 contract now also enforces them inside every balance, ownership, and

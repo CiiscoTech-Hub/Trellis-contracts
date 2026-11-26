@@ -3,6 +3,7 @@
 use crate::storage::persistent_set;
 use soroban_sdk::{contracterror, contracttype, Bytes, BytesN, Env};
 
+#[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StateSnapshot {
     pub wallet_revision: u64,
@@ -21,6 +22,7 @@ pub enum StaleStateReason {
     LedgerAdvanced = 3,
 }
 
+#[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RecoveryAction {
     RefreshWallet,
@@ -342,9 +344,6 @@ mod tests {
         current.ledger_sequence += 1;
         let recovered = check_before_replay(&env, &id, current).unwrap();
         assert_eq!(recovered.status, QueuedOperationStatus::Conflict);
-        assert_eq!(
-            recovered.conflict_reason,
-            StaleStateReason::LedgerAdvanced
-        );
+        assert_eq!(recovered.conflict_reason, StaleStateReason::LedgerAdvanced);
     }
 }

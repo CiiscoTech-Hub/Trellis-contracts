@@ -503,6 +503,16 @@ pub fn fail_migration(
     Ok(journal)
 }
 
+/// Verify that a migration rollback left the journal in a consistent,
+/// recoverable state. Pure check: it reads the journal but writes nothing.
+pub fn verify_rollback_state(journal: &MigrationJournal) -> bool {
+    match journal.status {
+        MigrationStatus::Failed => journal.failed_step.is_some() && journal.last_error != 0,
+        MigrationStatus::NotStarted => journal.completed_steps == 0 && journal.failed_step.is_none(),
+        _ => false,
+    }
+}
+
 /// Finish a migration after running post-checks.
 ///
 /// All checks must pass. A failing check marks the journal `Failed` and

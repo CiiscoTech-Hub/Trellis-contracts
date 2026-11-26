@@ -378,9 +378,9 @@ dependencies = [
 
 [[package]]
 name = "ed25519-dalek"
-version = "2.2.0"
+version = "2.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "70e796c081cee67dc755e1a36a0a172b897fab85fc3f6bc48307991f64e4eca9"
+checksum = "4a3daa8e81a3963a60642bcc1f90a670680bd4a77535faa384e9d1c79d620871"
 dependencies = [
  "curve25519-dalek",
  "ed25519",
@@ -823,6 +823,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
+name = "ops-checks"
+version = "0.1.0"
+dependencies = [
+ "aid-contract",
+ "shared",
+ "soroban-sdk",
+]
+
+[[package]]
 name = "oracle-contract"
 version = "0.1.0"
 dependencies = [
@@ -1061,6 +1070,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "retention-enforcement"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk",
+]
+
+[[package]]
 name = "rfc6979"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1233,6 +1249,7 @@ dependencies = [
 name = "shared"
 version = "0.1.0"
 dependencies = [
+ "ed25519-dalek",
  "soroban-sdk",
 ]
 
@@ -1250,6 +1267,14 @@ checksum = "77549399552de45a898a580c1b41d445bf730df867cc44e6c0233bbc4b8329de"
 dependencies = [
  "digest",
  "rand_core 0.6.4",
+]
+
+[[package]]
+name = "signed-audit-receipts"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "soroban-sdk",
 ]
 
 [[package]]

@@ -1,0 +1,19 @@
+# Aid record schema compatibility matrix (Issue #470), for shared::compat.
+# Written for a build whose current record schema version is 2.
+#
+# envelope       : V1 (LegacyAidRecord) | V2 (CurrentAidRecord)
+# schema_version : the V2 record's schema_version field (`-` for V1, which has none)
+# amount         : record amount
+# to_latest      : read path result, ok or the Error variant
+# downgrade      : downgrade_v2_to_v1 result (`-` for V1)
+# from_latest    : write path result (`-` for V1; V1 is never written)
+id,envelope,schema_version,amount,to_latest,downgrade,from_latest
+C01,V1,-,500,ok,-,-
+C02,V1,-,0,SchemaMigrationFailed,-,-
+C03,V1,-,-1,SchemaMigrationFailed,-,-
+C04,V2,2,500,ok,ok,ok
+C05,V2,1,500,UnsupportedSchemaVersion,ok,UnsupportedSchemaVersion
+C06,V2,3,500,UnsupportedSchemaVersion,UnsupportedSchemaVersion,UnsupportedSchemaVersion
+C07,V2,0,500,UnsupportedSchemaVersion,UnsupportedSchemaVersion,UnsupportedSchemaVersion
+C08,V2,2,0,SchemaMigrationFailed,ok,SchemaMigrationFailed
+C09,V2,99,0,UnsupportedSchemaVersion,UnsupportedSchemaVersion,UnsupportedSchemaVersion

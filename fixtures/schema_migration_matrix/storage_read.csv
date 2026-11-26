@@ -1,0 +1,26 @@
+# Storage schema read-guard matrix (Issue #470).
+# Written for a build that reads storage schema versions 1..=2 (current = 2).
+#
+# stored : version under the `stor_ver` instance key, or `missing` (a contract
+#          deployed before the guard existed)
+# policy : strict = guard_storage_read
+#          legacy = validate_storage_schema_read(env, true)
+#          ensure = ensure_storage_schema_version
+# expect : ok:<version returned>, or the Error variant returned
+id,stored,policy,expect
+R01,missing,strict,UnsupportedSchemaVersion
+R02,missing,legacy,ok:1
+R03,missing,ensure,NotFound
+R04,0,strict,UnsupportedSchemaVersion
+R05,0,legacy,UnsupportedSchemaVersion
+R06,0,ensure,UnsupportedSchemaVersion
+R07,1,strict,ok:1
+R08,1,legacy,ok:1
+R09,1,ensure,ok:1
+R10,2,strict,ok:2
+R11,2,legacy,ok:2
+R12,2,ensure,ok:2
+R13,3,strict,UnsupportedSchemaVersion
+R14,3,legacy,UnsupportedSchemaVersion
+R15,3,ensure,UnsupportedSchemaVersion
+R16,4294967295,strict,UnsupportedSchemaVersion

@@ -10,8 +10,8 @@ pub use logging::log_trade;
 use shared::events::emit_action_executed;
 pub use slippage_predictor::predict_slippage;
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Symbol, Vec,
-    U256,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Symbol,
+    Vec, U256,
 };
 
 #[contracttype]
@@ -115,8 +115,24 @@ pub struct SimulationResult {
     pub expected_slippage: U256,
 }
 
+/// The planner's decision before submitting a rebalance transaction.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RebalanceDecision {
+    Execute,
+    DeferredForDrift,
+    DeferredForGas,
+}
+
 #[contract]
 pub struct MultiAssetRebalancer;
+
+/// The rebalancer contract does not accept a caller-supplied correlation ID
+/// (a rebalance is not tied to a request-scoped workflow), so every correlated
+/// event uses the canonical zero correlation ID.
+fn zero_correlation_id(env: &Env) -> BytesN<32> {
+    BytesN::from_array(env, &[0; 32])
+}
 
 #[contractimpl]
 impl MultiAssetRebalancer {
@@ -161,6 +177,26 @@ impl MultiAssetRebalancer {
             .instance()
             .set(&StorageKey::Capacity(asset_in, asset_out), &capacity);
         Ok(())
+    }
+
+    /// Apply a hysteresis band to portfolio drift and defer work whose
+    /// estimated cost exceeds the caller's current gas budget. Equality at
+    /// the drift threshold is intentional: it makes the trigger stable at
+    /// the boundary instead of oscillating between two decisions.
+    pub fn decide_rebalance(
+        _env: Env,
+        portfolio_drift_bps: u32,
+        hysteresis_bps: u32,
+        estimated_gas: u64,
+        gas_budget: u64,
+    ) -> RebalanceDecision {
+        if portfolio_drift_bps < hysteresis_bps {
+            RebalanceDecision::DeferredForDrift
+        } else if estimated_gas > gas_budget {
+            RebalanceDecision::DeferredForGas
+        } else {
+            RebalanceDecision::Execute
+        }
     }
 
     pub fn rebalance(
@@ -233,6 +269,7 @@ impl MultiAssetRebalancer {
 
         emit_action_executed(
             &env,
+            &zero_correlation_id(&env),
             symbol_short!("reb"),
             symbol_short!("rebal"),
             &env.current_contract_address(),

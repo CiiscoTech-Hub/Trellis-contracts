@@ -12,8 +12,11 @@ members = [
     "contracts/upgradeability",
     "shared",
     "testing",
+    "ops-checks",
     "contracts/rebalancer-contract",
     "contracts/nft-marketplace",
+    "contracts/signed-audit-receipts",
+    "contracts/retention-enforcement",
 ]
 
 [workspace.dependencies]

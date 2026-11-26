@@ -1,9 +1,18 @@
 [
   {
     "version": "unreleased",
+    "date": "2026-11-22",
+    "impact": "compatible",
+    "summary": "Added an unauthenticated dependency-aware health endpoint to RegistryContract with authenticated status and dependency reporting, failure counters, and recovery semantics.",
+    "migration_notes": "No migration is required. Existing registry deployments remain compatible; clients may call health after deployment.",
+    "issue": 279,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
     "date": "2026-09-26",
     "impact": "breaking",
-    "summary": "Record schema versioning (V1/V2) added; V1 writes are now rejected \u2014 only V2 (with token binding) may be newly written, though V1 reads remain supported indefinitely via migrate_v1_to_v2.",
+    "summary": "Record schema versioning (V1/V2) added; V1 writes are now rejected — only V2 (with token binding) may be newly written, though V1 reads remain supported indefinitely via migrate_v1_to_v2.",
     "migration_notes": "Any integrator or off-chain indexer still writing the V1 shape (no token binding) must move to V2 before this ships to mainnet. See docs/COMPATIBILITY.md for the full read/write path and the deprecation timeline.",
     "issue": 64,
     "pr": 68
@@ -12,7 +21,7 @@
     "version": "unreleased",
     "date": "2026-09-26",
     "impact": "compatible",
-    "summary": "Added the migration safety framework (dry_run, MigrationJournal, post-checks, rollback strategy) in shared::migration \u2014 opt-in tooling for future schema/data migrations, not itself a change to any existing contract's interface.",
+    "summary": "Added the migration safety framework (dry_run, MigrationJournal, post-checks, rollback strategy) in shared::migration — opt-in tooling for future schema/data migrations, not itself a change to any existing contract's interface.",
     "migration_notes": "",
     "issue": 51,
     "pr": 71
@@ -147,7 +156,7 @@
     "version": "unreleased",
     "date": "2026-10-17",
     "impact": "compatible",
-    "summary": "Implemented permission-aware export pipeline with bounded memory streaming, in-flight cancellation, multi-module role authorization (Treasury, Aid, Referral, Governance, Oracle, Marketplace), and forbidden field purging in shared::export.",
+    "summary": "Implemented permission-aware export pipeline with bounded memory streaming, in-flight cancellation, role auth (Treasury, Aid, Referral, Governance, Oracle, Marketplace), and forbidden field purging in shared::export.",
     "migration_notes": "",
     "issue": 300,
     "pr": null
@@ -156,7 +165,7 @@
     "version": "unreleased",
     "date": "2026-10-18",
     "impact": "compatible",
-    "summary": "Added external dependency degradation matrix with failure modes, tiered degradation levels, user-safe fallback strategies, automated verification checks, and recovery receipts in shared::degradation (Issue #231).",
+    "summary": "Added dependency degradation matrix with failure modes, tiered degradation levels, user-safe fallback strategies, automated verification checks, and recovery receipts in shared::degradation (Issue #231).",
     "migration_notes": "",
     "issue": 231,
     "pr": null
@@ -165,7 +174,7 @@
     "version": "unreleased",
     "date": "2026-10-18",
     "impact": "compatible",
-    "summary": "Implemented risk-scored abuse detection for suspicious high-impact operations with explainable risk signals, strike accumulation, step-up dual-authorization review, velocity throttling, and safe low-risk allowance in shared::abuse and shared::risk_scoring (Issue #242).",
+    "summary": "Implemented risk-scored abuse detection for suspicious high-impact actions with explainable signals, strike accumulation, step-up dual-authorization, velocity throttling, and safe low-risk allowance in shared::abuse (#242).",
     "migration_notes": "",
     "issue": 242,
     "pr": null
@@ -174,7 +183,7 @@
     "version": "unreleased",
     "date": "2026-10-18",
     "impact": "compatible",
-    "summary": "Implemented policy simulation preview framework before committing irreversible or high-impact changes, previewing affected records and users, expected operational side effects, and rollback constraints in shared::policy_preview (Issue #250).",
+    "summary": "Implemented policy simulation preview framework before committing irreversible changes, previewing affected records, expected operational side effects, and rollback constraints in shared::policy_preview (Issue #250).",
     "migration_notes": "",
     "issue": 250,
     "pr": null
@@ -285,6 +294,213 @@
     "summary": "Added event dead-letter operator tooling: bounded list_event_dead_letters with status and due-ledger filters, event_dead_letter_summary, admin bulk requeue_dead_letters with per-id outcomes, and scripts/dead-letter-ops.cjs (#267).",
     "migration_notes": "",
     "issue": 267,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-10-22",
+    "impact": "compatible",
+    "summary": "Implemented snapshot restore verification for critical data and derived indexes in shared::snapshot_restore: tests restores against invariants across 6 modules, rebuilds secondary views, and provides rollback recovery.",
+    "migration_notes": "",
+    "issue": null,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-11-19",
+    "impact": "compatible",
+    "summary": "Added synthetic monitoring for high-value aid journeys against real aid contract in ops_checks::high_value_journeys and binary, with failure attribution, severity alerts, paused-claim retry, and reconciliation probes (#451).",
+    "migration_notes": "",
+    "issue": 451,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-11-19",
+    "impact": "compatible",
+    "summary": "Added executable recovery checks for escrow incident runbook in ops_checks::incident_runbook; shared::operator_runbook::evaluate_runbook now fails closed when a mandatory check is Skipped or InProgress (#452).",
+    "migration_notes": "No contract, storage or event change. Off-chain callers of evaluate_runbook (none in this repository) must mark mandatory checks Passed explicitly; a skipped or unfinished mandatory check now yields all_passed = false.",
+    "issue": 452,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-11-21",
+    "impact": "compatible",
+    "summary": "Added four-pillar release readiness checks in shared::release_readiness for migration, security, smoke test, and rollback rehearsal validation (#422).",
+    "migration_notes": "",
+    "issue": 422,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-11-21",
+    "impact": "compatible",
+    "summary": "Implemented deterministic duplicate detection and merge review in shared::duplicate_merge_review with pre-merge snapshots and auditable state transitions (#427).",
+    "migration_notes": "",
+    "issue": 427,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-11-21",
+    "impact": "compatible",
+    "summary": "Added high-cardinality telemetry redaction, label bounding, and deterministic sampling with error-bypass guarantees in shared::telemetry_protection (#428).",
+    "migration_notes": "",
+    "issue": 428,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-11-21",
+    "impact": "compatible",
+    "summary": "Implemented O(1) stale session watermark invalidation, security epochs, and single-token revocation handling in shared::session_revocation (#430).",
+    "migration_notes": "",
+    "issue": 430,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-11-21",
+    "impact": "compatible",
+    "summary": "Implemented bounded cache invalidation, ledger-based stale entry detection, and capacity eviction safeguards in shared::bounded_cache (#500).",
+    "migration_notes": "",
+    "issue": 500,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-11-21",
+    "impact": "compatible",
+    "summary": "Added duplicate-submission concurrency coverage, deterministic idempotent re-execution verification, and stale-version conflict rejection in testing::concurrency_dup_stale (#501).",
+    "migration_notes": "",
+    "issue": 501,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-11-21",
+    "impact": "compatible",
+    "summary": "Implemented privacy-safe export with field-level authorization, allow-list filtering, and personal data redaction in shared::export (#502).",
+    "migration_notes": "",
+    "issue": 502,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-11-21",
+    "impact": "compatible",
+    "summary": "Implemented feature rollout guardrails, verified emergency disablement, and idempotent manual emergency_stop in shared::rollout_guard (#503).",
+    "migration_notes": "",
+    "issue": 503,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-11-21",
+    "impact": "compatible",
+    "summary": "Built NFT collection floor price guard with TWAP smoothing and wash-trade filter with bounded ring-buffer history and self-dealing detection in shared::nft_guard (#543).",
+    "migration_notes": "",
+    "issue": 543,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-11-21",
+    "impact": "compatible",
+    "summary": "Created recurring pull-authorization with non-cumulative period caps, lifetime spend ceilings, and pause/resume lifecycle controls in shared::recurring_payments (#544).",
+    "migration_notes": "",
+    "issue": 544,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-11-21",
+    "impact": "compatible",
+    "summary": "Implemented registry contract version pinning, deprecation notice tracking, and sunset decommissioning guards in shared::registry_pinning and registry-contract (#545).",
+    "migration_notes": "",
+    "issue": 545,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-11-21",
+    "impact": "compatible",
+    "summary": "Added workspace WASM build determinism verification and Soroban budget regression gate with 10% threshold and ceiling bounds in shared::wasm_determinism and scripts (#546).",
+    "migration_notes": "",
+    "issue": 546,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-11-24",
+    "impact": "compatible",
+    "summary": "Added oracle price feed heartbeat validation and L2 deviation quarantine with auto-recovery and admin override controls in shared::oracle_quarantine (#518).",
+    "migration_notes": "",
+    "issue": 518,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-11-24",
+    "impact": "compatible",
+    "summary": "Created multi-asset treasury reserve floor and auto-pause guard preventing reserve exhaustion and locking outflows on breach in shared::treasury_floor (#520).",
+    "migration_notes": "",
+    "issue": 520,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-11-24",
+    "impact": "compatible",
+    "summary": "Implemented governance proposal timelock cancellation and collective admin veto quorum in shared::governance_timelock (#521).",
+    "migration_notes": "",
+    "issue": 521,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-11-24",
+    "impact": "compatible",
+    "summary": "Added NFT royalty split invariant enforcement across secondary sales guaranteeing exact token conservation and multi-recipient shares in shared::nft_royalty (#522).",
+    "migration_notes": "",
+    "issue": 522,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-11-22",
+    "impact": "compatible",
+    "summary": "Added privacy-safe export with field-level authorization and allowlist filtering in shared::export, withholding personal fields for non-owner operational queries without mutating stored state (#581).",
+    "migration_notes": "",
+    "issue": 581,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-11-22",
+    "impact": "compatible",
+    "summary": "Implemented feature-flag rollout guard with staged canary traffic bucketing, error rate trip thresholds, and emergency rollback verification across all modules (#582).",
+    "migration_notes": "",
+    "issue": 582,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-11-22",
+    "impact": "compatible",
+    "summary": "Added WCAG 2.1 AA keyboard navigation, roving tabindex, modal focus traps, and async transaction status ARIA live region mapping in shared::accessibility and scripts (#583).",
+    "migration_notes": "",
+    "issue": 583,
+    "pr": null
+  },
+  {
+    "version": "unreleased",
+    "date": "2026-11-22",
+    "impact": "compatible",
+    "summary": "Created contributor diagnostics command and environment invariant validation across toolchain, Soroban SDK pins, Dalek crypto, and storage schema integrity (#584).",
+    "migration_notes": "",
+    "issue": 584,
     "pr": null
   }
 ]
