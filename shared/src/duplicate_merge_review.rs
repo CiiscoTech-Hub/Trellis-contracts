@@ -244,7 +244,7 @@ pub fn approve_merge(
         return Ok(proposal);
     }
     if proposal.state != MergeReviewState::Pending {
-        return Err(Error::InvalidState);
+        return Err(Error::InvalidTransition);
     }
 
     let now = env.ledger().timestamp();
@@ -274,7 +274,7 @@ pub fn reject_merge(
         return Ok(proposal);
     }
     if proposal.state != MergeReviewState::Pending && proposal.state != MergeReviewState::Approved {
-        return Err(Error::InvalidState);
+        return Err(Error::InvalidTransition);
     }
 
     let now = env.ledger().timestamp();
@@ -304,7 +304,7 @@ pub fn apply_merge(
         return Ok(proposal);
     }
     if proposal.state != MergeReviewState::Approved {
-        return Err(Error::InvalidState);
+        return Err(Error::InvalidTransition);
     }
 
     let now = env.ledger().timestamp();
@@ -334,7 +334,7 @@ pub fn revert_merge(
         return Ok(proposal);
     }
     if proposal.state != MergeReviewState::Applied {
-        return Err(Error::InvalidState);
+        return Err(Error::InvalidTransition);
     }
 
     let now = env.ledger().timestamp();
@@ -364,7 +364,7 @@ pub fn finalize_merge(
         return Ok(proposal);
     }
     if proposal.state != MergeReviewState::Applied {
-        return Err(Error::InvalidState);
+        return Err(Error::InvalidTransition);
     }
 
     let now = env.ledger().timestamp();
@@ -478,10 +478,10 @@ mod tests {
         let finalized = finalize_merge(&env, &admin, prop.proposal_id).unwrap();
         assert_eq!(finalized.state, MergeReviewState::Finalized);
 
-        // Attempting to revert a finalized merge MUST fail with InvalidState
+        // Attempting to revert a finalized merge MUST fail with InvalidArgument
         assert_eq!(
             revert_merge(&env, &admin, prop.proposal_id),
-            Err(Error::InvalidState)
+            Err(Error::InvalidTransition)
         );
     }
 
@@ -550,7 +550,7 @@ mod tests {
         // Cannot apply rejected merge
         assert_eq!(
             apply_merge(&env, &admin, prop.proposal_id),
-            Err(Error::InvalidState)
+            Err(Error::InvalidTransition)
         );
     }
 
@@ -585,7 +585,7 @@ mod tests {
         // Applying directly from pending without approval fails
         assert_eq!(
             apply_merge(&env, &admin, prop.proposal_id),
-            Err(Error::InvalidState)
+            Err(Error::InvalidTransition)
         );
 
         // Non-existent proposal returns NotFound

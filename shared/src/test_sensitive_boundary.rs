@@ -541,6 +541,7 @@ fn test_webhook_ingress_enforces_replay_and_future_window() {
 
 #[test]
 fn test_export_allowlist_preserves_safe_fields() {
+    let env = Env::default();
     let safe_fields = [
         symbol_short!("id"),
         symbol_short!("type"),
@@ -557,7 +558,7 @@ fn test_export_allowlist_preserves_safe_fields() {
     ];
     for s in &safe_fields {
         assert!(is_export_allowlisted_field(s));
-        assert!(!is_forbidden_export_field(s));
+        assert!(!is_forbidden_export_field(&env, s));
     }
 }
 

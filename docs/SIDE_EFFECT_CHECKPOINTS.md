@@ -26,7 +26,11 @@ Each `effect_id` is deterministically derived from `(contract_address, op_id, st
 2. **Interrupted `Prepared` state:** If a previous attempt left the checkpoint in `Prepared` without committing or failing, `begin_side_effect` returns `BeginEffectOutcome::Retry(cp)` and increments `attempts`. The same operation id, step, kind, target, payload hash, and contract address must be reused to find that checkpoint.
 3. **Retry exhaustion:** Once `attempts >= DEFAULT_MAX_EFFECT_RETRIES` (5), `begin_side_effect` returns `Err(Error::QuotaExceeded)`.
 4. **Zero error code:** `fail_side_effect` rejects `error_code == 0` with `Err(Error::InvalidArgument)`.
-5. **Actor isolation:** Only the originating `actor` can retry, commit, or fail a checkpoint (`Error::Unauthorized` otherwise).
+5. **Actor isolation:** Only the originating `actor` can retry, commit, or fail a checkpoint (`Error::Unauthorized` otherwise). A rejected call leaves the stored checkpoint unchanged.
+6. **Unknown `effect_id`:** `commit_side_effect`, `fail_side_effect` and `rollback_side_effect` return `Err(Error::NotFound)`.
+7. **Payload isolation:** Changing any of `op_id`, `step_index`, `kind`, `target` or `payload_hash` yields a different `effect_id`, so a committed effect never suppresses a different one.
+8. **Terminal states:** `fail_side_effect` on a `Committed` or `RolledBack` checkpoint returns `Err(Error::AlreadyExecuted)`, as does `commit_side_effect` on a `RolledBack` one. `commit_side_effect` and `rollback_side_effect` are idempotent when repeated on a checkpoint already in the target state.
+9. **Commit after a recorded failure:** If the external call succeeded after `fail_side_effect` was recorded, `commit_side_effect` moves `Failed` to `Committed` and clears `last_error`.
 
 ## Verification
 

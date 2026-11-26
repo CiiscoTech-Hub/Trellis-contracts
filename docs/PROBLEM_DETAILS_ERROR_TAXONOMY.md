@@ -55,3 +55,79 @@ Contracts return stable numeric error codes across execution entry points. Off-c
 ## Migration & Compatibility
 - Purely additive: existing contract error enums and Soroban event layouts are unchanged.
 - Backward-compatible with all existing frontend clients and indexing pipelines.
+
+---
+
+## Automated Test Coverage (Issue #576)
+
+A dedicated test module `shared/src/test_problem_details_taxonomy.rs` provides
+comprehensive path coverage across all four required dimensions.
+
+### Normal path
+- Every primary error code (authorization, validation, not-found, conflict, settlement,
+  configuration, internal) in every contract domain maps to its correct stable machine
+  code, HTTP status class, category, and retryability flag.
+- `problem_details_from_error` agrees with `resolve_problem_details` for all core
+  `Error` variants.
+- `stable_code` agrees with `describe_error` for all documented domain/code pairs.
+- `problem_details_for_error` and `problem_details_for_diagnostic_error` produce
+  non-empty, non-leaking `code`, `kind`, `message`, `remediation`, and `docs_url` fields.
+- `PROBLEM_TYPE_BASE_URI` is pinned as `urn:trellis:error:` and must not drift.
+
+### Failure path
+- Unknown codes (0, `u32::MAX`, 999 999) return a safe `SYS_ERR` / `UNEXPECTED_ERROR`
+  record with HTTP 500 and `is_retryable = false`.
+- `is_documented` returns `false` for unregistered codes.
+- No user-facing message contains internal Rust keywords (`panic`, `unwrap`, etc.).
+- Every documented code in every domain has a non-empty message and a recovery hint.
+
+### Retry path
+- `ContractPaused` (503) and `DependencyDegraded` (503) have `is_retryable = true`
+  and a positive `retry_after_ms`.
+- Permanent codes (authorization, conflict, validation, internal) have
+  `is_retryable = false` and `retry_after_ms = 0`.
+- Domain-specific transient errors (rate-limiting, timelock, milestone-not-verified,
+  queue-full, treasury-insufficient-funds, governance-below-threshold) are all
+  retryable.
+- Upgrade rollback and feature-rollback codes are non-retryable.
+- `ContractPaused` backoff is ≥ `DependencyDegraded` backoff.
+
+### Authorization path
+- `inspect_problem_details` returns the full `ProblemDetailsRecord` for admin callers,
+  for both known and unknown codes.
+- Non-admin callers receive `Error::Unauthorized` for every code, including
+  publicly-known transient codes.
+
+### Edge cases
+- Code `960` has different stable meanings in `SupportAccess` and `FeatureFlags`
+  domains — the domain is the disambiguating axis.
+- Code `961` likewise differs by domain.
+- Upgrade rollback (913) is always permanent.
+- Aid milestone boundary codes (114–117) are verified individually.
+- Marketplace boundary codes (2000, 2023, out-of-range 2024) are verified.
+- AccessControl ownership-transfer codes (218–221) are individually verified.
+- `describe_error` does not panic for any `u32` input in any domain.
+
+---
+
+## Recovery and Rollback Behavior
+
+### Error taxonomy additions (additive only)
+New error codes are always additive: existing codes never change their numeric
+discriminant, machine code, HTTP status, or retryability. When a new variant is
+added to `errors.rs`:
+
+1. Add a new branch in `error_taxonomy.rs` under the appropriate domain.
+2. Add the corresponding `problem_code`, `user_message`, and `remediation_hint`
+   branches in `errors.rs`.
+3. Extend the coverage tables in `test_problem_details_taxonomy.rs`.
+4. Update this document's edge-case section.
+
+### Rollback
+Because the taxonomy is a pure mapping layer with no on-chain storage and no
+contract events, rolling back a taxonomy change requires only a code revert — no
+migration, no ledger entry cleanup, and no on-chain side-effects.
+
+### Information-leakage audit
+Run `cargo test` after every taxonomy change. The `failure_path_message_never_contains_internal_identifiers`
+test will catch any user-facing field that leaks an internal Rust identifier.

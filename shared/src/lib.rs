@@ -82,7 +82,6 @@ pub mod rare_failure_fixtures;
 pub mod release_artifacts;
 pub mod release_readiness;
 pub mod replay;
-pub mod reentrancy_guard;
 pub mod resumable_repair;
 pub mod risk_scoring;
 pub mod rollout_guard;
@@ -123,8 +122,14 @@ pub mod nft_guard;
 pub mod recurring_payments;
 pub mod registry_pinning;
 pub mod wasm_determinism;
+pub mod oracle_quarantine;
+pub mod treasury_floor;
+pub mod governance_timelock;
+pub mod nft_royalty;
 #[cfg(test)]
 pub mod test_boundary_properties;
+#[cfg(test)]
+pub mod test_problem_details_taxonomy;
 #[cfg(test)]
 pub mod test_schema_compat;
 // Re-export the most commonly-needed items at crate root for ergonomic use.
@@ -141,10 +146,6 @@ pub use allowlist::{
     validate_destination as validate_allowlisted_destination,
     validate_url as validate_allowlisted_url, AllowlistError, AllowlistPolicy,
     MAX_ALLOWLIST_ENTRIES, MAX_EXTENSION_LEN, MAX_HOST_LEN,
-};
-pub use reentrancy_guard::{
-    enter_guarded_call, exit_guarded_call, get_call_telemetry, reset_call_telemetry,
-    CallDepthTelemetry, GuardError, GuardToken, MAX_CALL_DEPTH, TOPIC_REENTRANCY_GUARD,
 };
 pub use risk_scoring::{
     assess_and_record, evaluate_risk, get_actor_profile, get_risk_policy, reset_actor_risk,
@@ -304,4 +305,23 @@ pub use registry_pinning::{
 pub use wasm_determinism::{
     evaluate_budget_regression, verify_wasm_determinism, BudgetRegressionVerdict,
     DeterminismGateError, DeterminismReport, ResourceBudget, WasmArtifactFingerprint,
+};
+pub use oracle_quarantine::{
+    compute_deviation_bps, evaluate_price_update, force_quarantine_feed,
+    release_quarantine_override, validate_heartbeat, HeartbeatConfig, OracleQuarantineError,
+    QuarantineConfig, QuarantineEvaluation, QuarantineStatus,
+};
+pub use treasury_floor::{
+    configure_reserve_floor, evaluate_reserve_outflow, get_reserve_surplus,
+    manual_pause_reserve_guard, unpause_reserve_guard, ReserveAutoPauseState, ReserveFloorConfig,
+    TreasuryFloorError,
+};
+pub use governance_timelock::{
+    cancel_queued_timelock, cast_proposal_veto, queue_proposal_timelock,
+    validate_timelock_execution, GovernanceTimelockError, TimelockEntry, TimelockLifecycleStatus,
+    VetoOutcome, VetoRecord,
+};
+pub use nft_royalty::{
+    compute_and_verify_royalty_split, validate_royalty_config, NftRoyaltyError,
+    RoyaltyExecutionPlan, RoyaltySplitRecipient,
 };

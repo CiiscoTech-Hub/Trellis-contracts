@@ -212,6 +212,58 @@ mod tests {
     }
 
     #[test]
+    fn voucher_redemption_is_locked_until_verification_and_retryable() {
+        let fx = setup();
+        let id = fx.milestone_aid(&[300, 700]);
+        let stranger = Address::generate(&fx.env);
+
+        assert_eq!(
+            fx.client.try_redeem_aid_voucher(&stranger, &id, &0),
+            Err(Ok(AidError::Unauthorized))
+        );
+        assert_eq!(
+            fx.client.try_redeem_aid_voucher(&fx.recipient, &id, &0),
+            Err(Ok(AidError::MilestoneNotVerified))
+        );
+
+        fx.client.verify_milestone(&fx.inspector, &id, &0);
+        fx.client.redeem_aid_voucher(&fx.recipient, &id, &0);
+
+        assert_eq!(fx.status(id), AidStatus::PartiallyClaimed);
+        assert_eq!(fx.token.balance(&fx.recipient), 300);
+        assert_eq!(
+            fx.client.try_redeem_aid_voucher(&fx.recipient, &id, &0),
+            Err(Ok(AidError::MilestoneAlreadyClaimed))
+        );
+    }
+
+    #[test]
+    fn expired_voucher_clawback_returns_only_unredeemed_tranches() {
+        let fx = setup();
+        let id = fx.milestone_aid(&[300, 700]);
+        let stranger = Address::generate(&fx.env);
+
+        fx.client.verify_milestone(&fx.inspector, &id, &0);
+        fx.client.redeem_aid_voucher(&fx.recipient, &id, &0);
+        fx.expire();
+
+        assert_eq!(
+            fx.client.try_clawback_expired_aid_voucher(&stranger, &id),
+            Err(Ok(AidError::Unauthorized))
+        );
+        fx.client.clawback_expired_aid_voucher(&fx.donor, &id);
+
+        assert_eq!(fx.status(id), AidStatus::Refunded);
+        assert_eq!(fx.token.balance(&fx.recipient), 300);
+        assert_eq!(fx.token.balance(&fx.donor), 10_000 - 300);
+        assert_eq!(fx.escrow(), 0);
+        assert_eq!(
+            fx.client.try_clawback_expired_aid_voucher(&fx.donor, &id),
+            Err(Ok(AidError::AlreadyRefunded))
+        );
+    }
+
+    #[test]
     fn refund_returns_every_unclaimed_tranche() {
         let fx = setup();
         let id = fx.milestone_aid(&[300, 200, 500]);
